@@ -34,3 +34,6 @@ select = ["E", "F", "I", "UP", "B"]
 # asyncio_mode=auto：async 测试不用逐个打装饰器，减少样板（对应"代码不炫技"）。
 asyncio_mode = "auto"
 testpaths = ["tests"]
+# pythonpath=["."]：uv 非包模式下项目本体没被安装进 venv，pytest 默认只把 tests/ 塞进
+# sys.path，`from app.main import app` 会 No module named 'app'（2026-10-06 实测踩坑）。
+pythonpath = ["."]
