@@ -5,9 +5,10 @@ seam 的位置就在这里：网关核心只认下面的 Provider 协议，具�
 接口按能力命名（Provider、chat），实现按技术命名（DashScopeProvider）。
 """
 
+from collections.abc import AsyncIterator
 from typing import Protocol, runtime_checkable
 
-from app.schemas import ChatCompletionResponse, ChatRequest
+from app.schemas import ChatCompletionChunk, ChatCompletionResponse, ChatRequest
 
 
 class UpstreamError(Exception):
@@ -32,6 +33,20 @@ class Provider(Protocol):
         """非流式对话：把统一请求翻成上游方言，调用后把结果翻回统一响应。
 
         为什么 async：上游调用是网络 IO，不能堵事件循环（W2 流式会更依赖这点）。
-        流式 chat_stream 是 W2 的事，到时协议加方法、各适配器补实现。
         """
         ...  # Protocol 方法体永远是省略号：它只声明形状，不做实事
+
+    async def chat_stream(self, request: ChatRequest) -> AsyncIterator[ChatCompletionChunk]:
+        """流式对话：返回统一 chunk 的异步流——进出都是 chunk，**不是 SSE 字节**。
+
+        为什么不是 SSE：SSE 是网关**面向客户端**的 HTTP 方言（归 streaming/ 模块），
+        上游各自的 SSE 方言归各适配器，统一 chunk 居中——两头方言互不泄漏
+        （ADR-0001：核心只见协议，W2 按预告在此扩方法）。
+
+        给初学者的解释（async 生成器在本代码库首次出现）：`async def` 里带 `yield`
+        的函数叫异步生成器——调用它不执行函数体，只拿到一个"惰性流"；`async for`
+        每问一句，函数体才往下跑到下一个 `yield` 吐出一块。这让"上游逐块到达、
+        网关逐块转发"天然对齐：内存里永远只有当前这一块，不必等整答攒完——
+        打字机效果的机制本体就在这里。
+        """
+        ...  # 与 chat 同理：Protocol 只声明形状，实现见各适配器

@@ -6,9 +6,11 @@ POST；统一形状已经由 app/schemas 定死，方言翻译必须收在本文
 交给库的黑盒，翻译边界就讲不清了（面试口径：调库谁都会，边界自己守）。
 """
 
+from collections.abc import AsyncIterator
+
 import httpx
 
-from app.schemas import ChatCompletionResponse, ChatRequest
+from app.schemas import ChatCompletionChunk, ChatCompletionResponse, ChatRequest
 from providers.base import UpstreamError
 
 # DashScope 的 OpenAI 兼容前缀（官方文档口径）：/chat/completions 挂在它下面。
@@ -77,3 +79,17 @@ class DashScopeProvider:
         # id/model/choices/usage 原样透传进统一模型；多余字段（system_fingerprint 之类）
         # Pydantic 默认丢弃而非报错，上游悄悄加字段不会打爆网关。
         return ChatCompletionResponse.model_validate(response.json())
+
+    async def chat_stream(self, request: ChatRequest) -> AsyncIterator[ChatCompletionChunk]:
+        """流式适配尚未实现（issue 04 才接 wire `stream: true` 与上游 SSE 方言）。
+
+        为什么现在就占位：协议在 issue 01 就按 ADR-0001 预告加了 chat_stream，
+        而 @runtime_checkable 的 isinstance 只查方法存在——本方法不写，
+        既有 test_dashscope 的协议断言会红，违反 spec 回归线"既有测试一条不改全绿"。
+        为什么抛 NotImplementedError 而不是 UpstreamError：这不是"上游拒了"
+        （那会伪装成 502 上游故障误导排错），是"适配器这一块还没写"。
+        为什么最后有个 yield：让它保持 async 生成器形状，与协议及 fake 实现同类——
+        方法体在首次被消费时执行，raise 先于 yield 触发，占位永不吐出假数据。
+        """
+        raise NotImplementedError("DashScope 流式在 issue 04 实现（wire stream:true + 方言解析）")
+        yield  # pragma: no cover —— 只为凑 async 生成器形状，永远执行不到

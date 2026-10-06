@@ -2,7 +2,8 @@
 
 为什么集中在这里：wire 形状是网关的对外契约，app 路由与 providers 适配器
 都对着这份模型说话——单一真源，改形状只改一处。
-只放 v1 非流式必需的字段，字段取舍随 W2~W3 需求走，不为未来预埋。
+只放当前版本实际用到的字段（非流式整答 + 流式 chunk），字段取舍随 W3 需求走，
+不为未来预埋（usage 回填、tools 等到了再加）。
 """
 
 from pydantic import BaseModel
@@ -16,10 +17,12 @@ class ChatMessage(BaseModel):
 
 
 class ChatRequest(BaseModel):
-    """客户端请求体：OpenAI 形状的最小子集（model + messages）。"""
+    """客户端请求体：OpenAI 形状的最小子集（model + messages + stream）。"""
 
     model: str
     messages: list[ChatMessage]
+    # 缺省 False：既有非流式客户端零改动（spec 故事 5）；True 时路由分派到 SSE 流
+    stream: bool = False
 
 
 class Usage(BaseModel):
@@ -46,3 +49,39 @@ class ChatCompletionResponse(BaseModel):
     model: str
     choices: list[Choice]
     usage: Usage
+
+
+# ===== 流式形状（W2 issue 01：chat.completion.chunk）=====
+
+
+class DeltaMessage(BaseModel):
+    """流式增量（chunk 的 choices[].delta）：对整条消息的一次"补丁"。
+
+    为什么字段可空：OpenAI 的 delta 是逐块累积——首块带 role 宣告角色、
+    中块只带 content、末块是空对象，没有的字段就是 None（不是另一种形状）。
+    """
+
+    role: str | None = None  # 只在首块出现："我是 assistant"
+    content: str | None = None  # 中块的正文增量，各块拼起来=完整回答
+
+
+class StreamChoice(BaseModel):
+    """一档候选的流式增量（与非流式 Choice 同 index 语义，message 换成 delta）。"""
+
+    index: int = 0  # 非流式先只有单选，恒 0
+    delta: DeltaMessage  # 本帧的增量内容
+    finish_reason: str | None = None  # 只在末块为 "stop"，其余帧为 None
+
+
+class ChatCompletionChunk(BaseModel):
+    """服务端流式响应体：OpenAI chat.completion.chunk 形状（每帧一个）。
+
+    为什么不复用 ChatCompletionResponse：整答的 choices[].message 是"完整消息"，
+    流的 choices[].delta 是"增量补丁"——两种消费方式，硬塞进一个模型会让两侧
+    字段全变成可空的"四不像"，客户端契约反而更难讲清。
+    """
+
+    id: str  # 同一次流内各帧共用一个 id（OpenAI 惯例：客户端靠它归组）
+    object: str = "chat.completion.chunk"  # 固定字面量，客户端靠它区分"帧"与"整答"
+    model: str
+    choices: list[StreamChoice]

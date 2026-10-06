@@ -5,15 +5,65 @@ fake 就是那个确定性、零延迟、永不赖床的上游。它不继承 Pr
 仅凭方法签名就满足协议（鸭子类型），这本身就是 seam 的演示。
 """
 
+import asyncio
 import uuid
+from collections.abc import AsyncIterator
 
-from app.schemas import ChatCompletionResponse, ChatMessage, ChatRequest, Choice, Usage
+from app.schemas import (
+    ChatCompletionChunk,
+    ChatCompletionResponse,
+    ChatMessage,
+    ChatRequest,
+    Choice,
+    DeltaMessage,
+    StreamChoice,
+    Usage,
+)
+
+# 流式回显句切成固定 4 块：确定性分块是 02/03 断言的地基——切法掺随机，
+# "拼回等于完整回显""卡在第几块"这类断言就没法写了。
+STREAM_CHUNK_COUNT = 4
+
+
+def _chunk(
+    chunk_id: str,
+    model: str,
+    *,
+    role: str | None = None,
+    content: str | None = None,
+    finish_reason: str | None = None,
+) -> ChatCompletionChunk:
+    """把三种帧（首块 role / 中块 content / 末块 finish_reason）的拼装收成一处。
+
+    为什么抽这层：chat_stream 要造多个只差字段的同构 chunk，逐个手写
+    ChatCompletionChunk(...) 会把"帧形状"重复多遍——形状将来一改（W3 加 usage）
+    要改多处。参数化成唯一构造点，形状真源仍是一处。
+    """
+    return ChatCompletionChunk(
+        id=chunk_id,
+        model=model,
+        choices=[
+            StreamChoice(
+                delta=DeltaMessage(role=role, content=content),
+                finish_reason=finish_reason,
+            )
+        ],
+    )
 
 
 class FakeProvider:
-    """确定性 fake 上游：把最后一条用户消息回显进固定前缀的答复。"""
+    """确定性 fake 上游：把最后一条用户消息回显进固定前缀的答复（非流式 + 流式）。"""
 
     name = "fake"
+
+    def __init__(self, gate: asyncio.Event | None = None) -> None:
+        """可选闸门：控制 chat_stream 的产块节奏（spec 决定：fake 本来就是测试设施）。
+
+        为什么闸门放在 fake 而不是生产代码：W1 纪律"生产零测试钩子"——
+        超时/断连测试要能把流稳稳卡住，这个能力属于测试设施，装在测试设施身上。
+        为什么是 asyncio.Event：测试能显式 set 放行、可控可断言，不需要真实 sleep。
+        """
+        self._gate = gate
 
     async def chat(self, request: ChatRequest) -> ChatCompletionResponse:
         """回显式回答：证明请求内容穿过了 seam，而不是 fake 自说自话。
@@ -39,3 +89,48 @@ class FakeProvider:
             ],
             usage=Usage(),  # 计数归 billing/（W3），fake 回 0，不装懂
         )
+
+    async def chat_stream(self, request: ChatRequest) -> AsyncIterator[ChatCompletionChunk]:
+        """回显句的确定性流式版：首块宣告 role、中块按固定 N 块切、末块给 finish_reason。
+
+        与 chat() 共用同一条回显公式（fake-reply: <最后一条用户消息>）——
+        非流式与流式两条路径拼回的是同一句话，客户端怎么切着看都对得上。
+        为什么 async 生成器（协议形状，见 providers/base.py 的给初学者解释）：
+        每次 yield 一块，消费方（streaming/ 传送带）拿到一块转发一块。
+        """
+        # 行级：回显素材与 chat() 同源——证明 stream 请求也把内容送进了 seam
+        text = f"fake-reply: {request.messages[-1].content}"
+        # 行级：同一次流内各帧共用 id（OpenAI 惯例，客户端靠它把帧归成一组）
+        chunk_id = f"fake-{uuid.uuid4().hex[:8]}"
+
+        # 行级：首帧也过闸——03 的"首块前卡住"就卡在这道闸上
+        await self._pass_gate()
+        # 行级：首帧宣告角色（OpenAI 惯例：先说"我是 assistant"，content 先给空串）
+        yield _chunk(chunk_id, request.model, role="assistant", content="")
+
+        # 行级：确定性切块——第 i 块 = text[i*L//N : (i+1)*L//N]，
+        # 按长度等比分、无随机源：同样输入永远切出同样的边界
+        for i in range(STREAM_CHUNK_COUNT):
+            part = text[
+                i * len(text) // STREAM_CHUNK_COUNT : (i + 1) * len(text) // STREAM_CHUNK_COUNT
+            ]
+            if not part:  # 短句切出空段就跳过——空 content 帧没有信息量
+                continue
+            await self._pass_gate()
+            yield _chunk(chunk_id, request.model, content=part)
+
+        # 行级：末帧给结束信号（delta 空补丁 + finish_reason=stop），客户端据此收尾
+        await self._pass_gate()
+        yield _chunk(chunk_id, request.model, finish_reason="stop")
+
+    async def _pass_gate(self) -> None:
+        """产一块之前过一次闸：闸门关着就等，放行一块后立刻关门（turnstile 节奏）。
+
+        为什么放行即关：普通 Event 一 set 就永远开，测试没法"只放一块"——
+        02/03 要的是"把流稳稳按在第 k 块"的确定性节奏，每一帧都得重新开闸。
+        为什么闸门为 None 时直接放行：生产装配（create_provider）不传闸门，
+        fake 在生产路径上零开销、零等待——闸门纯粹是测试可选件。
+        """
+        if self._gate is not None:
+            await self._gate.wait()  # 等待点：卡住的流就停在这一行，取消也落在这一行
+            self._gate.clear()  # 行级：放行一块立即关门——下次产块要重新 set
