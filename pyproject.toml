@@ -1,0 +1,36 @@
+[project]
+name = "flowgate"
+version = "0.1.0"
+description = "Python LLM 流式网关（教学级核心，简历项目）"
+readme = "README.md"
+requires-python = ">=3.14"
+# 依赖红线见 AGENTS.md：基础设施可用、核心机制自建。
+# httpx 不用 requests/各家 SDK：统一走异步 + OpenAI 兼容 REST 裸调，正是"核心机制不引现成实现"的边界。
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn>=0.34",
+    "httpx>=0.28",
+]
+
+[dependency-groups]
+# dev 组只放开发期工具：pytest 走 TDD（红-绿-重构），ruff 是机械兜底（format + check）。
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.25",
+    "ruff>=0.9",
+]
+
+[tool.ruff]
+# 行宽 100：比默认 88 容得下中文注释（一个汉字占两列），又不至于一行写太长。
+line-length = 100
+target-version = "py314"
+
+[tool.ruff.lint]
+# 默认规则集起步（E/F/I 等），规范里"简单性红线"（禁 metaclass/嵌套推导式等）暂无现成规则可兜，
+# 靠走读验收；W4 再考虑加自定义边界检查脚本。
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.pytest.ini_options]
+# asyncio_mode=auto：async 测试不用逐个打装饰器，减少样板（对应"代码不炫技"）。
+asyncio_mode = "auto"
+testpaths = ["tests"]
