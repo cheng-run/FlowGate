@@ -1,4 +1,4 @@
-"""sse-streaming 测试（issue 01 流式最小闭环 / issue 02 断连不泄漏），接缝由 spec 预先约定。
+"""sse-streaming 测试（issue 01 流式闭环 / 02 断连不泄漏 / 03 错误语义），接缝由 spec 预先约定。
 
 两条缝：Provider 缝（直接消费 fake.chat_stream 的统一 chunk 流）+ HTTP 契约缝
 （TestClient / 手驱 ASGI 打 POST /v1/chat/completions 的 SSE 出口）。全部离线——
@@ -15,7 +15,7 @@ from fastapi.testclient import TestClient
 # 导入装配好的 app：跑的是真实应用（含装配处），与 chat 端点测试同一高度。
 from app.main import app
 from app.schemas import ChatCompletionChunk, ChatMessage, ChatRequest, DeltaMessage, StreamChoice
-from providers.base import Provider
+from providers.base import Provider, UpstreamError
 from providers.fake import FakeProvider
 
 client = TestClient(app)
@@ -477,3 +477,197 @@ async def test_chat_endpoint_leaves_zero_uncancelled_when_concurrent_disconnects
     uncancelled = [e for e in fake.stream_endings if e != "cancelled"]
     assert uncancelled == []  # 实测：并发 16 路中途断连，未被取消的上游 = 0
     assert fake.stream_endings.count("cancelled") == n  # 每路恰好记了一笔"被取消"
+
+
+# ===== issue 03：流式错误语义（首块前=可报错窗口 → 502/504；首块后=流已承诺 → 只截断）=====
+
+
+class _RefusingProvider:
+    """首块前必抛 UpstreamError 的流式桩：两条腿同一条失败消息——
+    "流式与非流式失败形状一致"的对照组（checklist 1）。"""
+
+    name = "stub-refusing"
+
+    async def chat(self, request: ChatRequest):
+        """非流式腿抛协议失败——与 chat_stream 同一消息，供对照两条腿的响应形状。"""
+        raise UpstreamError("上游 stub 返回 429: rate limited: quota exceeded")
+
+    async def chat_stream(self, request: ChatRequest):
+        """流式腿在**首块之前**抛协议失败——"可报错窗口"内的拒答形态。"""
+        raise UpstreamError("上游 stub 返回 429: rate limited: quota exceeded")
+        yield  # pragma: no cover —— 凑 async 生成器形状（同 dashscope 占位写法），raise 先于 yield
+
+
+def test_chat_endpoint_returns_502_when_upstream_refuses_before_first_chunk(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """证明：首块前上游拒答 → 502 且 detail 保留上游摘要，与非流式失败形状一致（checklist 1）。
+
+    怎么证明：流式桩两条腿抛同一条 UpstreamError，同一请求分别带 stream=true/false
+    发出，断言两次响应的 JSON 逐字段相等（同一失败形状的字面证明）且上游摘要原文在
+    detail 里。首块前是可报错窗口——错误必须以 HTTP 状态码说话，不许降级成
+    "200 + 半截流"（那会把拒答伪装成正常回答）。
+    """
+    monkeypatch.setattr("app.main.provider", _RefusingProvider())
+
+    streaming = client.post("/v1/chat/completions", json=_payload(stream=True))
+    non_streaming = client.post("/v1/chat/completions", json=_payload())
+
+    assert streaming.status_code == 502
+    assert non_streaming.status_code == 502
+    # 行级：同一失败形状 = 两次响应 body 逐字段一致（状态码已各自断言，这里钉 body）
+    assert streaming.json() == non_streaming.json()
+    # 行级：上游摘要原文直读——排错不用猜，这是"detail 保留上游摘要"的字面验收
+    assert "rate limited: quota exceeded" in streaming.json()["detail"]
+
+
+class _SilentProvider:
+    """一言不发的流式桩：chat_stream 一块不吐就正常结束——沉默版"拒答"（checklist 1 边角）。"""
+
+    name = "stub-silent"
+
+    async def chat(self, request: ChatRequest):
+        """不该被走到：stream=true 却分派到非流式腿=路由分派写错了，直接炸红。"""
+        raise AssertionError("stream=true 不应走非流式 chat()")
+
+    async def chat_stream(self, request: ChatRequest):
+        """空的 async 生成器：函数体一次都不执行，首块等待直接收到"没有下一块"。"""
+        return
+        yield  # pragma: no cover —— 凑 async 生成器形状，让方法保持异步流协议
+
+
+def test_chat_endpoint_returns_502_when_upstream_stream_empty_before_first_chunk(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """证明：首块前上游一条块都不给 → 502，不悬着也不装完整（checklist 1 边角）。
+
+    怎么证明：空流桩走 stream=true，断言 502 且 detail 有可读原因。反例是
+    "200 + 只有 [DONE]"——那等于把"上游一言不发"包装成完整空回答，客户端
+    分不清是模型真没话说还是链路坏了；或炸成 500 带栈——把上游的沉默变成
+    网关自己的故障。两种反例这条都挡。
+    """
+    monkeypatch.setattr("app.main.provider", _SilentProvider())
+
+    response = client.post("/v1/chat/completions", json=_payload(stream=True))
+
+    assert response.status_code == 502
+    # 行级：detail 是给人读的失败原因——空流这个根因必须在文案里可直读
+    assert response.json()["detail"]
+
+
+def test_chat_endpoint_returns_504_when_first_chunk_exceeds_gap_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """证明：首块前卡住超 gap 超时 → 504，语义=上游没按时说话（checklist 2）。
+
+    怎么证明：闸门 fake 永不放行（流被稳稳按在"一块都没出"），monkeypatch 把
+    gap 常量压到毫秒级，断言 504 且 detail 提到 gap 超时。全程零真实 sleep——
+    测试代码一行不睡，等待与超时全在机制内部发生；生产代码零测试钩子——
+    超时口径是模块常量（monkeypatch 目标）不是回调/注入。
+    """
+    # 行级：毫秒级 gap 是"快进键"：真实30 秒常量被压小，超时立刻发生，测试不等真时间
+    monkeypatch.setattr("streaming.sse.GAP_TIMEOUT_SECONDS", 0.05)
+    fake = FakeProvider(gate=asyncio.Event())  # 闸门永不开：首块永远等不来
+    monkeypatch.setattr("app.main.provider", fake)
+
+    response = client.post("/v1/chat/completions", json=_payload(stream=True))
+
+    assert response.status_code == 504
+    # 行级：detail 点名 gap 超时——钉住"这是块间隔预算用尽"，不是随便一个超时
+    assert "gap 超时" in response.json()["detail"]
+
+
+class _SelfTimingOutProvider:
+    """自带 TimeoutError 的流式桩：上游自己抛 builtin TimeoutError——gap 误标的反例现场。"""
+
+    name = "stub-self-timeout"
+
+    async def chat(self, request: ChatRequest):
+        """不该被走到：stream=true 却分派到非流式腿=路由分派写错了，直接炸红。"""
+        raise AssertionError("stream=true 不应走非流式 chat()")
+
+    async def chat_stream(self, request: ChatRequest):
+        """首块前抛 builtin TimeoutError——语义是"上游自己超时了"，不是"没按时说话"。"""
+        raise TimeoutError("upstream internal timeout")
+        yield  # pragma: no cover —— 凑 async 生成器形状，raise 先于 yield
+
+
+def test_chat_endpoint_returns_502_not_504_when_upstream_raises_timeout_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """证明：上游自带的 TimeoutError 不冒充 gap 超时——失败词汇一个词只说一件事。
+
+    怎么证明：自超时桩在首块前抛 builtin TimeoutError，断言 502（"上游答不上"族）
+    且 detail 不带"gap 超时"字样。反例是误标成 504"没按时说话"——排错方向整个
+    反过来（该查上游的会去查网关的闹钟）。gap 只认自己那个闹钟响，这是评审收严
+    钉住的边界。
+    """
+    monkeypatch.setattr("app.main.provider", _SelfTimingOutProvider())
+
+    response = client.post("/v1/chat/completions", json=_payload(stream=True))
+
+    assert response.status_code == 502
+    assert "gap 超时" not in response.json()["detail"]  # 不许把上游的超时说成网关的 gap
+
+
+def test_chat_endpoint_truncates_without_done_when_gap_times_out_mid_stream(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """证明：首块后卡住超 gap 超时 → 流截断、不发 [DONE]（checklist 3）。
+
+    怎么证明：预放行闸门 fake（首帧直通、第二帧起卡死）+ 毫秒级 gap 常量——
+    断言响应已 200（流已承诺，状态码这页翻过去了）、首块真发出过（截断在半路）、
+    结尾没有 [DONE]（半截可辨），fake 记账"被掐断"（超时处置也显式收上游）。
+    与 504 用例合看：同一种超时条件，首块前报错、首块后截断——
+    "可报错窗口在首块处关闭"就是这两条的对照。
+    """
+    monkeypatch.setattr("streaming.sse.GAP_TIMEOUT_SECONDS", 0.05)
+    fake = FakeProvider(gate=_pre_opened_gate)  # 每流预放行一把闸：首帧直通后卡死
+    monkeypatch.setattr("app.main.provider", fake)
+
+    response = client.post("/v1/chat/completions", json=_payload(stream=True))
+
+    assert response.status_code == 200  # 流已承诺：错误窗口关了，这是截断不是报错
+    assert "data: " in response.text  # 首块确实发出过——截断发生在半路，不是没开始
+    assert "[DONE]" not in response.text  # 半截回答绝不能带完成记号（故事 10）
+    assert fake.stream_endings == ["cancelled"]  # 超时掐流也走显式收尾记账，不悬垂
+
+
+class _ExplodingProvider:
+    """半路爆炸的流式桩：吐一块之后抛错——"首块后上游抛错"的现场（checklist 4）。"""
+
+    name = "stub-exploding"
+
+    async def chat(self, request: ChatRequest):
+        """不该被走到：stream=true 却分派到非流式腿=路由分派写错了，直接炸红。"""
+        raise AssertionError("stream=true 不应走非流式 chat()")
+
+    async def chat_stream(self, request: ChatRequest):
+        """先给一块（承诺已成立），再抛异常——错必须发生在"首块后"才有截断语义。"""
+        yield ChatCompletionChunk(
+            id="boom-1",
+            model=request.model,
+            choices=[StreamChoice(delta=DeltaMessage(content="半截"))],
+        )
+        raise RuntimeError("wire exploded mid-stream")
+
+
+def test_chat_endpoint_truncates_without_done_when_upstream_errors_mid_stream(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """证明：首块后上游抛错 → 流截断、不发 [DONE]，原因进日志（checklist 4）。
+
+    怎么证明：半路爆炸桩先吐一块再抛 RuntimeError，断言 200 + 首块在正文里 +
+    无 [DONE]（与超时截断同一处置），且 caplog 里能查到异常消息——流的死因在
+    HTTP 出口看不见（200 + 半截帧），"原因进日志"是排错的唯一线索，必须可断言。
+    """
+    monkeypatch.setattr("app.main.provider", _ExplodingProvider())
+
+    response = client.post("/v1/chat/completions", json=_payload(stream=True))
+
+    assert response.status_code == 200  # 流已承诺：抛错也翻不成状态码，只能截断
+    assert "半截" in response.text  # 首块内容真的到达过客户端——错发生在半路
+    assert "[DONE]" not in response.text  # 半截回答绝不能带完成记号
+    # 行级：死因进日志（caplog 收 root 传播的记录）——"原因进日志"的字面验收
+    assert "wire exploded mid-stream" in caplog.text

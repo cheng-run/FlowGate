@@ -3,7 +3,7 @@
 对应"五站走位"（docs/architecture-notes.md §一）：/health 是探活旁路；
 /v1/chat/completions 走"单上游直调"形态（第 3~4 站的 W1 版），并按
 request.stream 分派 JSON 整答或 SSE 流（第 5 站，W2 issue 01 最小闭环；
-断连/超时语义在后续 issue）。resolve/fallback（第 3 站完整版）是 W3。
+断连清理 02、错误语义 03 已收进 streaming/）。resolve/fallback（第 3 站完整版）是 W3。
 """
 
 import os
@@ -15,7 +15,7 @@ from app.schemas import ChatCompletionResponse, ChatRequest
 from providers.base import Provider, UpstreamError
 from providers.dashscope import DEFAULT_BASE_URL, DashScopeProvider
 from providers.fake import FakeProvider
-from streaming.sse import sse_response
+from streaming.sse import GapTimeoutError, sse_response
 
 
 def create_provider() -> Provider:
@@ -73,6 +73,19 @@ async def upstream_error_handler(request: Request, exc: UpstreamError) -> JSONRe
     return JSONResponse(status_code=502, content={"detail": str(exc)})
 
 
+@app.exception_handler(GapTimeoutError)
+async def gap_timeout_handler(request: Request, exc: GapTimeoutError) -> JSONResponse:
+    """gap 超时（仅首块前能走到这）→ 504，语义=上游没按时说话（spec 错误契约）。
+
+    为什么 504 不是 502：502 是"上游拒了"（有原因可读），504 是"没按时说话"——
+    客户端对两者的重试直觉不同（502 该换路/换 key，504 值得等一会再试）。
+    为什么只有首块前会走到这：首块后同一条件在 streaming/ 里就地截断（流已承诺、
+    200 已发出），异常根本不会穿到 HTTP 层——本 handler 就是"可报错窗口"的出口，
+    窗口在首块处关闭（W3"重试窗口限死在首 token 之前"的契约面）。
+    """
+    return JSONResponse(status_code=504, content={"detail": str(exc)})
+
+
 @app.get("/health")
 def health() -> dict[str, str]:
     """健康检查：给探活/监控用的最小契约（200 + status=ok）。
@@ -99,8 +112,10 @@ async def chat_completions(request: ChatRequest) -> ChatCompletionResponse | Str
     # 行级：流式分支——统一 chunk 流交给 streaming/ 装配成 SSE 响应。
     # 路由只做"选哪种响应"这一个决定（传送带纪律：序列化、[DONE]、上游收尾
     # 与断连清理全归 streaming/ 模块，业务逻辑不进 HTTP 层）。
+    # await 的理由（issue 03）：装配要先把首块取到手——首块前是可报错窗口，
+    # 拒答/超时在这抛出来还能翻 502/504，路由只是把装配结果递出去。
     if request.stream:
-        return sse_response(provider.chat_stream(request))
+        return await sse_response(provider.chat_stream(request))
     # 行级：W1 还没有 resolve/fallback（W3），直接把统一请求交给装配好的上游；
     # 路由本身零业务逻辑——这就是 seam 的样子，路由只当"传送带"。
     return await provider.chat(request)
