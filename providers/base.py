@@ -10,6 +10,16 @@ from typing import Protocol, runtime_checkable
 from app.schemas import ChatCompletionResponse, ChatRequest
 
 
+class UpstreamError(Exception):
+    """上游非 2xx 时由适配器抛出的错误——Provider 协议的"失败形状"。
+
+    为什么放 base.py：协议不只规定怎么成功，还规定怎么失败。核心代码只认
+    这个异常类型，翻译成 HTTP 502 时永远不需要认识 DashScope 的错误 JSON——
+    这与"核心只见协议不见实现"（ADR-0001）是同一条纪律的两面。
+    消息内容约定：状态码 + 上游响应摘要，让客户端能分辨 key 错 / 请求错 / 上游挂。
+    """
+
+
 # @runtime_checkable 让 isinstance 可用：测试能断言"满足协议"这件事本身。
 # 代价：isinstance 只查方法/属性存在，不查签名——签名错误靠测试兜（ADR-0001 取舍）。
 @runtime_checkable
