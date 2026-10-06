@@ -1,8 +1,9 @@
-"""sse-streaming 测试（issue 01：流式最小闭环），接缝由 spec 预先约定（Testing Decisions）。
+"""sse-streaming 测试（issue 01 流式最小闭环 / issue 02 断连不泄漏），接缝由 spec 预先约定。
 
 两条缝：Provider 缝（直接消费 fake.chat_stream 的统一 chunk 流）+ HTTP 契约缝
-（TestClient 打 POST /v1/chat/completions 的 SSE 字节出口）。全部离线——fake 上游
-零外网、闸门等待只设上限不排程，"测试全绿"在任何机器可复跑（spec 故事 29）。
+（TestClient / 手驱 ASGI 打 POST /v1/chat/completions 的 SSE 出口）。全部离线——
+fake 上游零外网、事件等待只设上限不真实 sleep，"测试全绿"在任何机器可复跑（spec 故事 29）。
+断连用例全在 HTTP 契约缝的 ASGI 协议高度完成（手动喂 http.disconnect），新增缝 0（方案 A）。
 """
 
 import asyncio
@@ -258,3 +259,221 @@ def test_chat_endpoint_closes_upstream_stream_after_completion(
     assert response.status_code == 200
     assert response.text.endswith("data: [DONE]\n\n")
     assert closed["finished"] is True  # 紧跟响应断言：收尾在流结束时就发生了
+
+
+# ===== issue 02：断连不泄漏（断连用例全在 HTTP 契约缝的 ASGI 协议高度，新增缝 0）=====
+
+
+def _asgi_scope() -> dict:
+    """POST /v1/chat/completions 的最小 ASGI scope——手动驱动协议层的"请求"这一半。
+
+    为什么 asgi.spec_version=2.3：uvicorn 0.54 实发 2.3（h11_impl 的 scope 构造），
+    StreamingResponse 对 2.4 以下走 listen_for_disconnect + task group 分支——
+    测试 scope 与生产同构，断连语义才是生产语义（不是测试自造的旁路）。
+    """
+    return {
+        "type": "http",
+        "asgi": {"version": "3.0", "spec_version": "2.3"},
+        "http_version": "1.1",
+        "method": "POST",
+        "path": "/v1/chat/completions",
+        "raw_path": b"/v1/chat/completions",
+        "root_path": "",
+        "scheme": "http",
+        "query_string": b"",
+        "headers": [(b"content-type", b"application/json")],
+        "client": ("127.0.0.1", 50000),  # 随便一个地址：路由不看它，凑齐 scope 形状即可
+        "server": ("127.0.0.1", 8000),
+    }
+
+
+class _ASGIDriver:
+    """手驱 ASGI 的收发两端：请求体一次、断连一个事件、send 记录全部消息。
+
+    为什么手驱 ASGI 而不用 TestClient：断连是协议层事件（uvicorn 生产发的正是
+    http.disconnect），TestClient 会替我们把响应一口气消费完——只有自己拿住
+    receive/send 才能在"回答半路"精确插进断连（方案 A：同一 HTTP 契约缝的
+    ASGI 高度，新增缝 0）。
+
+    给初学者的解释（ASGI 收发回调在本代码库首次出现）：ASGI 服务器不给应用传
+    "请求/响应"对象，而是给两个异步回调——receive() 逐条吐请求消息（先是
+    http.request 带正文，之后可能来 http.disconnect），send() 逐条收响应消息
+    （http.response.start 开头、http.response.body 带正文帧）。谁先动由消息驱动，
+    测试接管这两个回调后就能在任意时刻插断连——"断连用例在 ASGI 协议高度"
+    说的就是这件事。
+    """
+
+    def __init__(
+        self,
+        payload: dict,
+        *,
+        release_gate: asyncio.Event | None,
+        cancel_after: int,
+        hold_send: bool = False,
+    ) -> None:
+        """三种玩法的旋钮：放行闸门（None=闸门自管）、断连帧数、是否堵在 send 里。
+
+        release_gate 非 None：预放行首帧，此后每收一帧放行下一帧（turnstile 节奏），
+        产块进度被测试拿住；None：闸门自管（预放行形态，首帧后自行卡住）——
+        并发用例走这条，各路互不干扰。hold_send：断连后不退出 send 而是挂起——
+        把断连钉进"发帧窗口"（消费者弃流场景，02 的收尾盖子用例）。
+        """
+        self._payload = payload
+        self._release_gate = release_gate
+        self._cancel_after = cancel_after
+        self._hold_send = hold_send
+        self._hold = asyncio.Event()  # 永不放行：hold_send 模式的挂起点（取消会落在它的 wait 上）
+        self.sent: list[dict] = []
+        self._disconnect_now = asyncio.Event()
+        self._body_sent = False
+
+    async def receive(self) -> dict:
+        """首问给请求体（FastAPI 解析 ChatRequest 用），此后只等断连——与 uvicorn 同构。
+
+        为什么 body 只发一次：ASGI 里正文消息一个流一条（more_body=False 收口），
+        流生命周期里 receive 之后只会再来 http.disconnect，和生产收发顺序一致。
+        """
+        if not self._body_sent:
+            self._body_sent = True
+            body = json.dumps(self._payload).encode()
+            return {"type": "http.request", "body": body, "more_body": False}
+        await self._disconnect_now.wait()  # 事件等待（无真实 sleep）：等测试决定何时断连
+        return {"type": "http.disconnect"}
+
+    async def send(self, message: dict) -> None:
+        """记录每条消息；正文帧推进"回答进度"：没到断连点就放行下一帧，到了就断连。"""
+        self.sent.append(message)
+        if message["type"] != "http.response.body":
+            return  # 只关心正文帧：响应头/收尾帧不推进"回答进度"
+        # 复杂语句（推导式）行上：只数带正文的帧——空 body 是流收尾帧，不算进度
+        frames = sum(1 for m in self.sent if m["type"] == "http.response.body" and m.get("body"))
+        if frames < self._cancel_after:
+            if self._release_gate is not None:
+                self._release_gate.set()  # 放行下一帧：turnstile 关着，不放就卡住
+            return
+        self._disconnect_now.set()  # 收满即断连——此刻流正停在"回答半路"
+        if self._hold_send:
+            await self._hold.wait()  # 堵在发帧窗口：这个挂起点就是取消的落点
+
+    async def run(self) -> list[dict]:
+        """跑完整次 ASGI 调用（应用返回才回来），返回 send 记下的全部消息。"""
+        if self._release_gate is not None:
+            self._release_gate.set()  # 预放行首帧：闸门从关着起步，第一块由驱动器放进来
+        # 行级：ASGI 应用自己就是可调用对象（服务器的视角）——app(scope, receive, send)
+        await app(_asgi_scope(), self.receive, self.send)
+        return self.sent
+
+
+async def test_chat_endpoint_records_cancelled_when_client_disconnects_mid_stream(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """证明：客户端半路断开（ASGI 喂 http.disconnect），fake 记收尾=被取消——
+    断连不泄漏（checklist 1）。
+
+    怎么证明：闸门 fake 被驱动器按节奏放行，放过 3 帧（全流 6 帧的一半）后喂
+    http.disconnect。app 返回后**立即**断言 fake.stream_endings == ["cancelled"]——
+    全程不 gc.collect()、不 sleep：收尾若靠 GC 时机，返回这一刻不会有确定记录；
+    显式取消传播才让这条断言稳定为真（02 的"显式传播，不靠 GC 时机"）。
+    """
+    gate = asyncio.Event()  # 闸门从关着起步：产块节奏全由驱动器放行拿住
+    fake = FakeProvider(gate=gate)
+    monkeypatch.setattr("app.main.provider", fake)
+
+    driver = _ASGIDriver(_payload(stream=True), release_gate=gate, cancel_after=3)
+    sent = await asyncio.wait_for(driver.run(), timeout=2.0)  # 带上限：机制坏了红掉，不挂死 CI
+
+    # 复杂语句（推导式）行上：只数带正文的帧——恰好 3 帧=回答真在半路，不是没开始/已说完
+    frames = [m for m in sent if m["type"] == "http.response.body" and m.get("body")]
+    assert len(frames) == 3
+    assert fake.stream_endings == ["cancelled"]  # 显式传播的证据：无 gc、无 sleep 的断言
+
+
+def test_chat_endpoint_records_completed_when_stream_runs_to_end(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """证明：正常跑完的流 fake 记收尾=正常结束——与"被取消"可区分，防假绿（checklist 2）。
+
+    怎么证明：无闸门 fake（节奏零干扰）走 TestClient 全量消费到 [DONE]，断言
+    stream_endings == ["completed"]。与上一条断连用例合看：两种收尾各自可断言——
+    若收尾记录只有一种值、或断言恒真，这两条必有一条红。
+    """
+    fake = FakeProvider()  # 不带闸门：正常节奏跑完整条流
+    monkeypatch.setattr("app.main.provider", fake)
+
+    response = client.post("/v1/chat/completions", json=_payload(stream=True))
+
+    assert response.status_code == 200
+    assert response.text.endswith("data: [DONE]\n\n")  # 完整流必有完成记号
+    assert fake.stream_endings == ["completed"]  # 恰好一条记录且是"正常结束"
+
+
+async def test_chat_endpoint_records_cancelled_when_disconnect_during_send_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """证明：断连恰逢"发帧窗口"（响应任务悬在 await send）时上游也被显式取消，
+    不靠 GC（checklist 1 补强）。
+
+    怎么证明：驱动器把首帧送进 send 后就地堵住再喂 http.disconnect——这是 Starlette
+    弃流**不收**生成器的路径（实验证据见 .scratch/sse-streaming/issues/02 评论）：
+    取消落在 send 的 await 上、不穿生成器链，上游悬在 yield，收尾若只能等 GC，
+    app 返回这一刻账本必是空的。streaming/ 的收尾盖子在 ASGI 调用结束前显式
+    aclose，于是同样无 gc、无 sleep 地断言 stream_endings == ["cancelled"]。
+    """
+    fake = FakeProvider()  # 无闸门：首帧直达 send——本例卡的是发帧窗口，不是产块窗口
+    monkeypatch.setattr("app.main.provider", fake)
+
+    # hold_send：首帧进 send 即断连并堵在发帧窗口——模拟"写响应时客户端关了页面"，
+    # 取消落在 send 的挂起点上、不穿生成器链（见 docstring 的实验背景）
+    driver = _ASGIDriver(_payload(stream=True), release_gate=None, cancel_after=1, hold_send=True)
+    sent = await asyncio.wait_for(driver.run(), timeout=2.0)
+
+    # 复杂语句（any+推导式）行上：首帧确实到达过 send——断连在流进行中，场景不是空转
+    assert any(m["type"] == "http.response.body" and m.get("body") for m in sent)
+    assert fake.stream_endings == ["cancelled"]  # 收尾盖子的证据：弃流路径也显式收
+
+
+def _pre_opened_gate() -> asyncio.Event:
+    """工厂形态闸门：每条流开工时领一把**已放行**的闸——首帧直通、第二帧起卡住。
+
+    为什么并发用例要每流一闸：asyncio.Event 一 set() 唤醒所有等待者，不是计数
+    信号量——N 条流共用一把时"放行一块即关门"的 turnstile 会互踩（一条流偷走
+    另一条的放行）。为什么预放行：各流不需要外部再点名放行就能稳定停在
+    "首帧已发"的半路状态，断连完全由各驱动自己触发，零同步开销。
+    """
+    gate = asyncio.Event()
+    gate.set()
+    return gate
+
+
+async def test_chat_endpoint_leaves_zero_uncancelled_when_concurrent_disconnects_mid_stream(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """证明：并发 N 路半路断连，未被取消的上游 = 0——"断连不泄漏"的实测数字（checklist 3）。
+
+    怎么证明：16 路并发各驱动一次 ASGI 流式请求（每流一把预放行闸门的真 fake，
+    首帧发出后即卡住=各路都停在"回答半路"），各自收到首帧后喂断连。结束后数
+    fake 的收尾账本两条一起看：不是 cancelled 的条目=记错了收尾（推导式断言），
+    总数不足 N=有流根本没记账（计数断言）——"未被取消的上游 = 0"就是这两条
+    同时成立，数字写进 issue 02 验收记录供 05/06 引用。
+    """
+    n = 16
+    fake = FakeProvider(gate=_pre_opened_gate)  # 工厂形态：每流一把独立闸门
+    monkeypatch.setattr("app.main.provider", fake)
+
+    # 复杂语句（gather+推导式）行上：16 路并发同一个 ASGI 应用（与生产同构——
+    # 一个 app 服务所有并发请求），每路带上限：坏一路红一路，不把整套件挂死
+    await asyncio.gather(
+        *(
+            asyncio.wait_for(
+                _ASGIDriver(_payload(stream=True), release_gate=None, cancel_after=1).run(),
+                timeout=2.0,
+            )
+            for _ in range(n)
+        )
+    )
+
+    # 复杂语句（推导式）行上：账本里不是"被取消"的条目=收尾记错的泄漏
+    # （没记账的泄漏抓不到账本里，由下面"总数==n"的计数断言兜住）
+    uncancelled = [e for e in fake.stream_endings if e != "cancelled"]
+    assert uncancelled == []  # 实测：并发 16 路中途断连，未被取消的上游 = 0
+    assert fake.stream_endings.count("cancelled") == n  # 每路恰好记了一笔"被取消"

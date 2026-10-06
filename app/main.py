@@ -15,7 +15,7 @@ from app.schemas import ChatCompletionResponse, ChatRequest
 from providers.base import Provider, UpstreamError
 from providers.dashscope import DEFAULT_BASE_URL, DashScopeProvider
 from providers.fake import FakeProvider
-from streaming.sse import sse_stream
+from streaming.sse import sse_response
 
 
 def create_provider() -> Provider:
@@ -93,17 +93,14 @@ async def chat_completions(request: ChatRequest) -> ChatCompletionResponse | Str
     形状不对 FastAPI 在进路由前就自动 422，脏请求永远到不了适配器
     （流式分支同样先过这道门，见 streaming 测试的 422 护栏）。
     为什么返回类型是联合：同一路径两种响应形状；response_model 仍钉住 JSON 腿的
-    契约，而 FastAPI 对 Response 实例（StreamingResponse 是其子类）不做
+    契约，而 FastAPI 对 Response 实例（StreamingResponse 及其子类）不做
     response_model 序列化——流式腿直接原样送出，两条腿互不干扰。
     """
-    # 行级：流式分支——统一 chunk 流交给 streaming/ 传送带转 SSE 帧。
+    # 行级：流式分支——统一 chunk 流交给 streaming/ 装配成 SSE 响应。
     # 路由只做"选哪种响应"这一个决定（传送带纪律：序列化、[DONE]、上游收尾
-    # 都归 streaming/ 模块，业务逻辑不进 HTTP 层）。
+    # 与断连清理全归 streaming/ 模块，业务逻辑不进 HTTP 层）。
     if request.stream:
-        return StreamingResponse(
-            sse_stream(provider.chat_stream(request)),
-            media_type="text/event-stream",
-        )
+        return sse_response(provider.chat_stream(request))
     # 行级：W1 还没有 resolve/fallback（W3），直接把统一请求交给装配好的上游；
     # 路由本身零业务逻辑——这就是 seam 的样子，路由只当"传送带"。
     return await provider.chat(request)

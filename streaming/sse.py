@@ -7,6 +7,8 @@
 
 from collections.abc import AsyncIterator
 
+from fastapi.responses import StreamingResponse
+
 from app.schemas import ChatCompletionChunk
 
 
@@ -37,3 +39,39 @@ async def sse_stream(chunks: AsyncIterator[ChatCompletionChunk]) -> AsyncIterato
         # 上游的 finally 因此立即执行——fake 在那里记"被取消"，02 的
         # "断连不泄漏"断言就落在这条传播链上。
         await chunks.aclose()
+
+
+class SSEStreamResponse(StreamingResponse):
+    """SSE 流式响应：把"流的收尾"钉死在 ASGI 调用返回之前（"断连不泄漏"的兜底盖子）。
+
+    为什么光有 sse_stream 的 finally 还不够（实验证据 2026-10-06，见 issue 02 评论）：
+    Starlette 的 StreamingResponse 弃流时**不收** body_iterator——客户端断连恰逢
+    "发帧窗口"（响应任务悬在 await send、生成器悬在 yield）时，取消不穿生成器链，
+    sse_stream 的 finally 没人触发，上游收尾只能等 GC finalizer（实测：ASGI 调用
+    返回后收尾旗标仍为假，gc.collect() 之后才变真）。卡在上游产块窗口的断连靠
+    取消穿链能显式收，但两个窗口合起来才是"断连"的全部——所以这里在 __call__
+    收尾处显式 aclose，把弃流路径也变成确定性收尾。
+    注意："取消中不被打断"的前提是清理链全同步收尾（当前成立）；W3 的 gap 超时
+    若在清理链里引入 await 挂起点，需重新核对此前提（记入 ADR-0003）。
+    """
+
+    async def __call__(self, scope, receive, send) -> None:
+        """ASGI 入口：流跑完、被取消还是 send 抛错，返回前都把流显式收掉。"""
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            # 给初学者的解释（弃流收尾形态的 aclose）：aclose() 会往生成器的挂起点抛
+            # GeneratorExit——sse_stream 的 finally 于是立刻执行、再显式 aclose 上游。
+            # 整条清理链全是同步收尾（fake 记账是纯同步），一步跑完不产生挂起点，
+            # 即使正处于取消传播中也不会被打断。正常跑完时生成器已耗尽，aclose 是空操作。
+            await self.body_iterator.aclose()
+
+
+def sse_response(chunks: AsyncIterator[ChatCompletionChunk]) -> SSEStreamResponse:
+    """路由装配点：统一 chunk 流 → 带确定性收尾的 SSE 响应。
+
+    为什么抽这层：路由只该做"选哪种响应"（传送带纪律）——媒体类型、帧序列化、
+    [DONE]、上游收尾、弃流盖子全在 streaming/ 一家，流生命周期的家只有一个
+    （spec 故事 20），换实现（如 W3 加 gap 超时）路由一行不动。
+    """
+    return SSEStreamResponse(sse_stream(chunks), media_type="text/event-stream")
