@@ -11,3 +11,7 @@ wheels/
 
 # Private documents
 docs/
+
+# 工作文件（issue tracker / spec）与密钥——敏感信息与工作稿永不入库（2026-10-06）
+.scratch/
+.env
