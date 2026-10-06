@@ -34,6 +34,12 @@ select = ["E", "F", "I", "UP", "B"]
 # asyncio_mode=auto：async 测试不用逐个打装饰器，减少样板（对应"代码不炫技"）。
 asyncio_mode = "auto"
 testpaths = ["tests"]
+# live = 真网 smoke（spec 故事 21）：注册 marker 消掉 PytestUnknownMarkWarning，
+# 无 DASHSCOPE_API_KEY 时测试内部自动 skip，CI 永不依赖它。
+markers = ["live: 真网 smoke 测试（需 DASHSCOPE_API_KEY，无则自动跳过）"]
+# 默认 deselect live（故事 22"任何测试不碰真网"）：只有 key 的环境裸 pytest 也绝不触网；
+# 真网验证显式跑 `uv run --env-file .env pytest -m live`（命令行 -m 覆盖此默认值）。
+addopts = "-m 'not live'"
 # pythonpath=["."]：uv 非包模式下项目本体没被安装进 venv，pytest 默认只把 tests/ 塞进
 # sys.path，`from app.main import app` 会 No module named 'app'（2026-10-06 实测踩坑）。
 pythonpath = ["."]
