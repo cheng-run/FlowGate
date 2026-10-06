@@ -5,21 +5,70 @@
 resolve/fallback（第 3 站完整版）是 W3，流式（第 5 站）是 W2。
 """
 
-from fastapi import FastAPI
+import os
+
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 
 from app.schemas import ChatCompletionResponse, ChatRequest
-from providers.base import Provider
+from providers.base import Provider, UpstreamError
+from providers.dashscope import DEFAULT_BASE_URL, DashScopeProvider
 from providers.fake import FakeProvider
+
+
+def create_provider() -> Provider:
+    """装配处核心：按环境变量选上游实例（spec 故事 5，默认 fake）。
+
+    这是生产装配逻辑本身，不是"为测试加的钩子"（spec 决定：不加工厂函数/不上 DI）——
+    选择逻辑无论放哪都得有个名字可调，写成函数只是把装配决策显式化；
+    它不接收任何注入参数，测试与生产走同一条入口。
+    读环境为什么不引 python-dotenv：uv 的 `--env-file .env` 启动时注入环境，
+    代码只读 os.environ——零新增依赖（依赖红线：能零依赖就不引库）。
+    """
+    # 上游选择：FLOWGATE_PROVIDER 缺省 fake——无 key 也能跑测试与演示
+    choice = os.environ.get("FLOWGATE_PROVIDER", "fake")
+    if choice == "fake":
+        return FakeProvider()
+    if choice == "dashscope":
+        # 缺 key 必须响亮且指名（故事 10）：静默降级回 fake 会让
+        # "我明明配了真上游，怎么答的还是回显"变成难查的悬案。
+        api_key = os.environ.get("DASHSCOPE_API_KEY", "")
+        if not api_key:
+            raise RuntimeError(
+                "FLOWGATE_PROVIDER=dashscope 但缺少环境变量 DASHSCOPE_API_KEY"
+                "（写入 .env，用 uv run --env-file .env 启动）"
+            )
+        # base_url 可覆盖（默认官方 OpenAI 兼容前缀）：接中转/代理靠这个口子
+        base_url = os.environ.get("DASHSCOPE_BASE_URL", DEFAULT_BASE_URL)
+        return DashScopeProvider(api_key=api_key, base_url=base_url)
+    # 未知取值同样响亮报错：拼错的上游名若静默回 fake，配置就形同虚设
+    raise RuntimeError(f"未知的 FLOWGATE_PROVIDER={choice!r}（可选：fake / dashscope）")
+
 
 # ===== 装配处（composition root）=====
 # 全代码库唯一允许点名具体适配器类的地方（ADR-0001）：核心路由只见 Provider 协议，
-# 换上游=改这一行。W1 只接 fake；接 DashScope 时改成按 config 里的名字挑实例。
-provider: Provider = FakeProvider()
+# 换上游=改环境变量 FLOWGATE_PROVIDER，业务代码一行不动。
+provider: Provider = create_provider()
 
 app = FastAPI(
     title="FlowGate",
     version="0.1.0",
 )
+
+
+@app.exception_handler(UpstreamError)
+async def upstream_error_handler(request: Request, exc: UpstreamError) -> JSONResponse:
+    """上游非 2xx → 网关 502，detail 保留上游响应摘要（spec 错误语义）。
+
+    为什么用异常处理器而不是路由里 try/except：路由保持"传送带"零业务逻辑；
+    失败翻译集中一处，将来接 fallback/重试（W3）时改动点也在这。
+    为什么 502 而不是 500：502（Bad Gateway）= 网关活着、上游答不上——
+    客户端据此能区分"网关坏了"和"上游拒了"，且上游原文在 detail 里可直读。
+    为什么 async（给初学者的解释）：FastAPI 要求异步路由的异常处理器也能挂进
+    事件循环——handler 里没有 await 也不坏事，声明成 async 只是跟它服务的
+    异步请求链路同一条调用约定，不占线程、不阻塞循环。
+    """
+    return JSONResponse(status_code=502, content={"detail": str(exc)})
 
 
 @app.get("/health")
