@@ -81,15 +81,78 @@ class DashScopeProvider:
         return ChatCompletionResponse.model_validate(response.json())
 
     async def chat_stream(self, request: ChatRequest) -> AsyncIterator[ChatCompletionChunk]:
-        """流式适配尚未实现（issue 04 才接 wire `stream: true` 与上游 SSE 方言）。
+        """流式对话：wire 带 stream:true 发出，把上游 SSE 方言逐块翻成统一 chunk。
 
-        为什么现在就占位：协议在 issue 01 就按 ADR-0001 预告加了 chat_stream，
-        而 @runtime_checkable 的 isinstance 只查方法存在——本方法不写，
-        既有 test_dashscope 的协议断言会红，违反 spec 回归线"既有测试一条不改全绿"。
-        为什么抛 NotImplementedError 而不是 UpstreamError：这不是"上游拒了"
-        （那会伪装成 502 上游故障误导排错），是"适配器这一块还没写"。
-        为什么最后有个 yield：让它保持 async 生成器形状，与协议及 fake 实现同类——
-        方法体在首次被消费时执行，raise 先于 yield 触发，占位永不吐出假数据。
+        为什么方言解析收进 _iter_unified_chunks（issue 04 的核心）：data: 行、上游
+        [DONE]、流式 wire 开关都是 DashScope 侧知识，收在适配器内可见可测（ADR-0001
+        方言边界）——核心只见 ChatCompletionChunk，永不见 "data:" 字样。
+        为什么 async with 持有 HTTP 流（生命周期考点）：client.stream() 打开的是同一条
+        HTTP 连接，连接生命周期就挂在这个生成器的栈帧上——生成器被 aclose（断连/截断）
+        时 GeneratorExit 在 yield 点抛入，async with 的 __aexit__ 立刻关连接。spec 写
+        "生成器 finally 里显式收"，async with 就是那层显式收口（__aexit__ 与 finally
+        同一时机跑，都不等 GC）；不再补一层空 finally——收尾代码一处即可，写两遍是假动作。
+        给初学者的解释：本方法是 async 生成器（形状见 providers/base.py）——方法体在
+        首次被消费时才执行，每 yield 一块，消费方（streaming/ 传送带）拿一块转一块。
         """
-        raise NotImplementedError("DashScope 流式在 issue 04 实现（wire stream:true + 方言解析）")
-        yield  # pragma: no cover —— 只为凑 async 生成器形状，永远执行不到
+        # 行级：请求翻译点（统一 → wire，同 chat()）——model_dump 恰是 OpenAI 形状
+        payload = request.model_dump()
+        # 行级：wire 的 stream:true 由适配器自己钉死——"流式"是本方法的方言知识，
+        # 不依赖调用方恰好传对（传 false 上游只回整答 JSON，流式整条链会莫名断掉）
+        payload["stream"] = True
+        try:
+            async with self._client.stream(
+                # 行级：wire 三要素（URL / Bearer 鉴权头 / JSON 体）与非流式同一方言（故事 13）
+                "POST",
+                f"{self._base_url}/chat/completions",
+                headers={"Authorization": f"Bearer {self._api_key}"},
+                json=payload,
+            ) as response:
+                # 行级：失败翻译点（wire → 协议异常，同 chat()）——非 2xx 绝不静默、
+                # 也不当成功解析：错误页长得像 JSON 但没有 chunk，硬解析会炸出误导性 500。
+                # 首块前抛 UpstreamError → 502（issue 03 的可报错窗口）；摘要截断 500 字符，
+                # 与 chat() 同口径（错误页可能巨长，detail 要一眼读完）。
+                if response.is_error:
+                    # 行级：先把错误页读出来——流式响应不读就取不到 text，摘要就是空的
+                    body = await response.aread()
+                    raise UpstreamError(
+                        f"上游 {self.name} 返回 {response.status_code}: "
+                        f"{body.decode(errors='replace')[:500]}"
+                    )
+                # 行级：逐行喂给方言解析入口——本函数只管流的生命周期，不认 data: 字样
+                async for chunk in self._iter_unified_chunks(response.aiter_lines()):
+                    yield chunk
+        except httpx.TransportError as exc:
+            # 行级：传输层失败（超时/拒连/中途断线）同翻进协议异常——裸 httpx 异常会
+            # 变成网关 500，客户端分不清"网关坏了"还是"够不着上游"。与 chat() 的同名
+            # 翻译**有意双写**（措辞一字不差）：两条腿各自的失败翻译都留在各自现场走读，
+            # 抽公共小函数省 3 行却把"失败形状在哪翻的"藏进第三处（chat() docstring 同理）
+            raise UpstreamError(f"上游 {self.name} 请求失败: {exc}") from exc
+
+    async def _iter_unified_chunks(
+        self, lines: AsyncIterator[str]
+    ) -> AsyncIterator[ChatCompletionChunk]:
+        """上游 SSE 行流 → 统一 chunk 流：方言解析的唯一入口（data: 行 / 上游 [DONE] / 坏帧）。
+
+        为什么单独一层（两重理由）：①这里是"wire → 统一"的翻译点，独立成函数走读时
+        一眼可指"方言止步于此"；②AGENTS.md 嵌套 ≤3——解析回路若嵌在 chat_stream 的
+        try/async with 里会到 4 层，搬出来后两个函数各自收在 3 层内。
+        """
+        async for line in lines:
+            # 行级：SSE 只认 data: 行——空行是帧分隔，event:/注释行是方言里不消费的部分
+            if not line.startswith("data:"):
+                continue
+            data = line.removeprefix("data:").strip()
+            if data == "[DONE]":
+                break  # 行级：上游完成记号——翻译到此为止，不产出假 chunk
+            try:
+                # 行级：翻译点（wire → 统一）；上游多给的字段（created 等）被 Pydantic
+                # 默认丢弃——方言垃圾不进统一模型，与非流式 chat() 同一策略
+                chunk = ChatCompletionChunk.model_validate_json(data)
+            except ValueError as exc:
+                # 行级：坏帧也翻进协议失败形状（评审补网）——ValidationError 裸漏会在
+                # 首块前穿成 500，把上游的脏数据说成网关自己的故障；消息带肇事行残片排错
+                # （ValidationError 继承 ValueError，json 解析失败同样在此接住）
+                raise UpstreamError(
+                    f"上游 {self.name} 发来无法解析的 SSE 数据行: {data[:200]}"
+                ) from exc
+            yield chunk
