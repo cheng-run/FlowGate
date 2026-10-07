@@ -13,6 +13,9 @@ from fastapi import Depends, FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from app.schemas import ChatCompletionResponse, ChatRequest
+from billing.identity import current_key, key_var
+from billing.ledger import BillingLedger, BudgetExceededError
+from billing.settlement import BillingProvider
 from providers.base import Provider, UpstreamError
 from providers.dashscope import DEFAULT_BASE_URL, DashScopeProvider
 from providers.fake import FakeProvider
@@ -92,10 +95,41 @@ def create_limiter() -> RateLimiter:
         ) from exc
 
 
+def create_ledger() -> BillingLedger:
+    """装配处：按环境变量装账本（env 口径，与 create_provider 同一纪律）。
+
+    FLOWGATE_BILLING_DB=SQLite 单文件路径（生产在 .env 指向落盘文件）；缺省
+    ":memory:"=进程内临时库——测试/演示零残留、离线可复跑（checklist 1 的口径：
+    测试用 tmp_path 临时文件显式构造账本，不依赖缺省）。
+    """
+    db_path = os.environ.get("FLOWGATE_BILLING_DB", ":memory:")
+    return BillingLedger(db_path)
+
+
+def create_budget() -> int:
+    """装配处：按环境变量装每 key 的 token 预算（FLOWGATE_BUDGET_TOKENS）。
+
+    0=不设限（缺省）：记账先跑、预算口径按部署调 env——"0"是"无预算"不是"零预算"。
+    为什么不给个有限缺省：预算一旦有限，账本跨重启累计（生产）就会在跑批场景里
+    突然 429；治理口径宁可显式开启（与限流不同：限流天然要挡，预算天然要看部署）。
+    """
+    try:
+        return int(os.environ.get("FLOWGATE_BUDGET_TOKENS", "0"))
+    except ValueError as exc:
+        # 行级：非数字=配置错，统一指名 env 变量（配错喊响，同 create_limiter 纪律）
+        raise RuntimeError(f"FLOWGATE_BUDGET_TOKENS 配置非法：{exc}") from exc
+
+
 # ===== 装配处（composition root）=====
 # 全代码库唯一允许点名具体适配器类的地方（ADR-0001）：核心路由只见 Provider 协议，
 # 换上游=改环境变量 FLOWGATE_PROVIDER，业务代码一行不动。
-provider: Provider = create_provider()
+# 账本单例先落座：结算门面与门卫的预算检查共用同一本账（用户账求和=花销唯一出处）
+ledger: BillingLedger = create_ledger()
+# 每 key 的 token 预算（0=不设限）：门卫进门先查它，超预算在上游调用前就 429
+budget: int = create_budget()
+# 结算门面包在**装配绑定**上、不进 create_provider：create_provider 的既有契约是
+# 装出可 isinstance 的上游/链（装配测试钉住），计费是其外的一层治理（与门卫同理）。
+provider: Provider = BillingProvider(create_provider(), ledger=ledger)
 # 限流器与上游同在装配处落座：门卫只认 RateLimiter 接口，换限流算法不惊动路由
 limiter: RateLimiter = create_limiter()
 
@@ -105,8 +139,8 @@ app = FastAPI(
 )
 
 
-class RequestIdMiddleware:
-    """ASGI 中间件：进门发号、响应挂号（X-Request-Id）——每逻辑请求一个对账号。
+class RequestContextMiddleware:
+    """ASGI 中间件：进门记身份（发号 + key 进背包）、响应挂号（X-Request-Id）。
 
     给初学者的解释（纯 ASGI 中间件在本代码库首次出现）：ASGI 应用就是一个
     async def __call__(scope, receive, send) 的可调用对象；中间件包一层，在 send
@@ -115,8 +149,11 @@ class RequestIdMiddleware:
     为什么不用 FastAPI 的 @app.middleware("http")：那走 BaseHTTPMiddleware，会接管
     响应体的逐块搬运（多一层内存流）——W2"断连不泄漏"建立在体不经第二人之手上，
     为加个响应头去动流的搬运路径得不偿失。
-    为什么发号在进门：号要先于路由存在——将来限流/预算门卫（进路由之前的一步）与
+    为什么发号在进门：号要先于路由存在——限流/预算门卫（进路由之前的一步）与
     billing 结算都按它对账；fallback 链的 attempts 直接取用，同一请求永不二号。
+    为什么 key 也在这里进背包（issue 06）：key 在进门才可见，结算却在收尾——
+    set/reset 必须罩住**整个**请求（含流式响应的发送）才不串门，能罩全的只有
+    中间件这一层；门卫与结算从背包取，不各自再解析一遍 Authorization。
     """
 
     def __init__(self, app) -> None:
@@ -124,13 +161,15 @@ class RequestIdMiddleware:
         self.app = app
 
     async def __call__(self, scope, receive, send) -> None:
-        """HTTP 请求进门发号并绑进 ContextVar；响应头带号；出门还原背包。"""
+        """HTTP 请求进门发号 + 记 key 进背包；响应头带号；出门还原背包。"""
         if scope["type"] != "http":
             # 行级：lifespan 等非 HTTP scope 不是"逻辑请求"——不发号、不碰，原样放行
             await self.app(scope, receive, send)
             return
         request_id = new_request_id()
         token = request_id_var.set(request_id)  # 行级：号放进"隐形背包"，链里伸手取
+        # 行级：bearer 身份进背包（匿名=None）——限流/预算/账本共用这一个身份口径
+        key_token = key_var.set(_bearer_key(_scope_header(scope, "authorization")))
 
         async def send_with_request_id(message: dict) -> None:
             """替身 send：只改 http.response.start（补 X-Request-Id），其余消息原样放行。"""
@@ -149,11 +188,12 @@ class RequestIdMiddleware:
         try:
             await self.app(scope, receive, send_with_request_id)
         finally:
-            # 行级：出门还原背包——同一任务若复用（测试里连续请求），号不串门
+            # 行级：出门还原背包——同一任务若复用（测试里连续请求），号与 key 都不串门
             request_id_var.reset(token)
+            key_var.reset(key_token)
 
 
-app.add_middleware(RequestIdMiddleware)
+app.add_middleware(RequestContextMiddleware)
 
 
 @app.exception_handler(UpstreamError)
@@ -208,6 +248,16 @@ async def rate_limit_handler(request: Request, exc: RateLimitError) -> JSONRespo
     return JSONResponse(status_code=429, content={"detail": str(exc)})
 
 
+@app.exception_handler(BudgetExceededError)
+async def budget_exceeded_handler(request: Request, exc: BudgetExceededError) -> JSONResponse:
+    """超预算 429：错误说得清"该提额了"（story 14）——与限流的"退避"是两种动作。
+
+    为什么也翻 429 而不是 402：spec 口径就是 429（拒绝进网关，还没到"要钱"的语义）；
+    两种 429 靠 detail 文案区分——限流说退避、预算说提额，客户端的下一步动作不同。
+    """
+    return JSONResponse(status_code=429, content={"detail": str(exc)})
+
+
 @app.get("/health")
 def health() -> dict[str, str]:
     """健康检查：给探活/监控用的最小契约（200 + status=ok）。
@@ -217,6 +267,18 @@ def health() -> dict[str, str]:
     """
     # 行级：只回固定字典，FastAPI 自动序列化成 JSON 200——不手写 Response，保持直白。
     return {"status": "ok"}
+
+
+def _scope_header(scope: dict, name: str) -> str | None:
+    """从 ASGI scope 取请求头（latin-1 解码，HTTP 头的字符集约定）；缺头=None。
+
+    为什么在中间件而不是 Request.headers 取：中间件层只有原始 scope——把 Authorization
+    翻成身份串就地完成（_bearer_key），进背包的是结果，不是原始头。
+    """
+    for raw_name, raw_value in scope.get("headers", ()):
+        if raw_name.decode("latin-1").lower() == name:
+            return raw_value.decode("latin-1")
+    return None
 
 
 def _bearer_key(authorization: str | None) -> str | None:
@@ -239,7 +301,7 @@ def _bearer_key(authorization: str | None) -> str | None:
     return value
 
 
-async def rate_limit_gate(request: Request) -> None:
+async def rate_limit_gate() -> None:
     """门卫（FastAPI 依赖）：进路由之前的一步——按 key 扣令牌，空桶抛 RateLimitError。
 
     给初学者的解释（FastAPI 依赖在本代码库首现）：Depends(rate_limit_gate) 把本函数
@@ -253,10 +315,23 @@ async def rate_limit_gate(request: Request) -> None:
     key 口径（2026-10-07 用户拍板，见 ADR-0007）：key=Authorization bearer 串；
     **匿名（无 Authorization）放行不占桶**——限流治理"每个身份不许打爆"，认证
     （W4）管"有没有身份"；W4 把认证插在本门卫之前，此处的 key 接口一字不改。
+    key 的出处（issue 06）：中间件进门时已把身份放进背包——门卫不再自己解析
+    Authorization（身份口径单一出处，结算门面取的是同一个）。
+    预算为什么排在限流前面（issue 06）："进门先查预算"（spec 口径）——超预算是
+    终局性的（再来多少次都没用），先说真话且不给注定被拒的请求消耗限流令牌。
     """
-    key = _bearer_key(request.headers.get("authorization"))
+    key = current_key()
     if key is None:
-        return  # 行级：匿名放行不占桶——口径见 docstring，限流用例都显式带 bearer
+        return  # 行级：匿名放行不占桶也不查预算——口径见 docstring，用例都显式带 bearer
+    # 行级：预算前置检查——花销按 key 对用户账求和，超预算在上游调用前 429（story 14）；
+    # 不设限（budget=0）连求和都不查，设限时求和只跑一趟（比较与文案共用一份数字）
+    if budget > 0:
+        spend = ledger.spend(key)
+        if spend >= budget:
+            raise BudgetExceededError(
+                f"预算已超：该 key 累计花销已达 {spend} tokens"
+                f"（预算 {budget} tokens），请提额后再来"
+            )
     limiter.acquire(key)  # 行级：空桶在此抛 RateLimitError → 异常处理器翻 429
 
 

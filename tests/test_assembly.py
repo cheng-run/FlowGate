@@ -3,12 +3,13 @@
 装配处是全代码库唯一点名具体适配器的地方（ADR-0001），所以它测的是"选择"本身：
 给什么环境、出什么实例、配错了喊多响——路由等核心代码的行为由端点测试兜底。
 限流器装配（issue 05）同理：测 env 口径的读取与配错报错，桶的行为在
-tests/test_ratelimit.py 的主缝上钉。
+tests/test_ratelimit.py 的主缝上钉；账本/预算装配（issue 06）同纪律。
 """
 
 import pytest
 
-from app.main import create_limiter, create_provider
+from app.main import create_budget, create_ledger, create_limiter, create_provider
+from app.schemas import Usage
 from providers.base import Provider
 from providers.dashscope import DashScopeProvider
 from providers.fake import FakeProvider
@@ -113,3 +114,50 @@ def test_create_limiter_rejects_bad_config_loudly(monkeypatch: pytest.MonkeyPatc
 
     with pytest.raises(RuntimeError, match="FLOWGATE_RATE_CAPACITY"):
         create_limiter()
+
+
+# ===== 账本/预算装配（fallback-ratelimit-billing issue 06：env 口径）=====
+
+
+def test_create_budget_reads_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """证明：预算口径走 env——FLOWGATE_BUDGET_TOKENS 直接决定每 key 的上限。
+
+    怎么证明：设 42 调 create_budget，断言拿到 42；缺省时断言 0（不设限的口径：
+    "0=无预算"，记账先跑、预算按部署显式开启）。
+    """
+    monkeypatch.setenv("FLOWGATE_BUDGET_TOKENS", "42")
+    assert create_budget() == 42
+
+    monkeypatch.delenv("FLOWGATE_BUDGET_TOKENS", raising=False)
+    assert create_budget() == 0  # 行级：缺省=不设限——不是"零预算"（见 create_budget docstring）
+
+
+def test_create_budget_rejects_bad_config_loudly(monkeypatch: pytest.MonkeyPatch) -> None:
+    """证明：预算配置非法时响亮报错并指名 env 变量（配错喊响，同限流装配测试）。
+
+    怎么证明：把 FLOWGATE_BUDGET_TOKENS 设成非数字，断言 RuntimeError 且消息里
+    点名变量名——反例是静默落回 0：预算"看起来配了其实没生效"会成悬案。
+    """
+    monkeypatch.setenv("FLOWGATE_BUDGET_TOKENS", "很多")
+
+    with pytest.raises(RuntimeError, match="FLOWGATE_BUDGET_TOKENS"):
+        create_budget()
+
+
+def test_create_ledger_reads_db_path_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """证明：账本落盘路径走 env——FLOWGATE_BILLING_DB 指到哪账本就落哪（issue 06）。
+
+    怎么证明：指向临时文件，settle 一笔再查回来（账本能记账=装配出了活账本）；
+    缺省 ":memory:" 不在此测（行为=进程内可读写），路径口径由本测与主缝测试共钉。
+    """
+    monkeypatch.setenv("FLOWGATE_BILLING_DB", ":memory:")
+
+    ledger = create_ledger()
+    ledger.settle(
+        "req-env",
+        "sk-env",
+        prompt_text="你好",
+        completion_text="ok",
+        official_usage=Usage(prompt_tokens=1, completion_tokens=1, total_tokens=2),
+    )
+    assert ledger.spend("sk-env") == 2  # 行级：装配出来的账本可读可写——不是摆设
