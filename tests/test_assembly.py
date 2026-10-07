@@ -2,14 +2,17 @@
 
 装配处是全代码库唯一点名具体适配器的地方（ADR-0001），所以它测的是"选择"本身：
 给什么环境、出什么实例、配错了喊多响——路由等核心代码的行为由端点测试兜底。
+限流器装配（issue 05）同理：测 env 口径的读取与配错报错，桶的行为在
+tests/test_ratelimit.py 的主缝上钉。
 """
 
 import pytest
 
-from app.main import create_provider
+from app.main import create_limiter, create_provider
 from providers.base import Provider
 from providers.dashscope import DashScopeProvider
 from providers.fake import FakeProvider
+from ratelimit.bucket import RateLimitError
 from routing.chain import FallbackChain
 
 
@@ -78,3 +81,35 @@ def test_create_provider_rejects_empty_entry_loudly(monkeypatch: pytest.MonkeyPa
 
     with pytest.raises(RuntimeError, match="FLOWGATE_PROVIDER"):
         create_provider()
+
+
+# ===== 限流装配（fallback-ratelimit-billing issue 05：env 口径）=====
+
+
+def test_create_limiter_reads_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """证明：限流口径走 env——FLOWGATE_RATE_CAPACITY/PER_SECOND 直接决定桶行为。
+
+    怎么证明：设容量 1、速率 0（永不回填），调 create_limiter 拿到限流器后对同一
+    key 连扣两枚——第一枚放行、第二枚 RateLimitError。反例（写死常量）下第二枚
+    也放行；这里用行为断言而不是读私有字段，测的是装配出的口径本身。
+    """
+    monkeypatch.setenv("FLOWGATE_RATE_CAPACITY", "1")
+    monkeypatch.setenv("FLOWGATE_RATE_PER_SECOND", "0")
+
+    limiter = create_limiter()
+
+    limiter.acquire("sk-env")  # 行级：第一枚——容量 1 的桶恰好放行
+    with pytest.raises(RateLimitError):
+        limiter.acquire("sk-env")  # 行级：第二枚——env 容量生效，桶已空
+
+
+def test_create_limiter_rejects_bad_config_loudly(monkeypatch: pytest.MonkeyPatch) -> None:
+    """证明：限流配置非法时响亮报错并指名 env 变量（配错喊响，同缺 key 测试）。
+
+    怎么证明：把 FLOWGATE_RATE_CAPACITY 设成非数字，断言 RuntimeError 且消息里
+    点名变量名——反例是静默落回默认值："我明明收紧了限流怎么没生效"会成悬案。
+    """
+    monkeypatch.setenv("FLOWGATE_RATE_CAPACITY", "两个")
+
+    with pytest.raises(RuntimeError, match="FLOWGATE_RATE_CAPACITY"):
+        create_limiter()

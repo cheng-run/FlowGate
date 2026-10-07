@@ -3,18 +3,20 @@
 对应"五站走位"（docs/architecture-notes.md §一）：/health 是探活旁路；
 /v1/chat/completions 走"单上游直调"形态（第 3~4 站的 W1 版），并按
 request.stream 分派 JSON 整答或 SSE 流（第 5 站，W2 issue 01 最小闭环；
-断连清理 02、错误语义 03 已收进 streaming/）。resolve/fallback（第 3 站完整版）是 W3。
+断连清理 02、错误语义 03 已收进 streaming/）。resolve/fallback（第 3 站完整版）是 W3；
+限流门卫（W3 issue 05）是**进路由之前的一步**（FastAPI 依赖形态），路由本体仍零业务。
 """
 
 import os
 
-from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from app.schemas import ChatCompletionResponse, ChatRequest
 from providers.base import Provider, UpstreamError
 from providers.dashscope import DEFAULT_BASE_URL, DashScopeProvider
 from providers.fake import FakeProvider
+from ratelimit.bucket import RateLimiter, RateLimitError
 from routing.chain import AttemptTimeoutError, FallbackChain
 from routing.request_id import new_request_id, request_id_var
 from streaming.sse import GapTimeoutError, sse_response
@@ -69,10 +71,33 @@ def _build_one(name: str, choice: str) -> Provider:
     )
 
 
+def create_limiter() -> RateLimiter:
+    """装配处：按环境变量装限流器（env 口径，与 create_provider 同一纪律）。
+
+    FLOWGATE_RATE_CAPACITY=桶容量（允许的突发），FLOWGATE_RATE_PER_SECOND=稳态吞吐
+    （tokens/s）。默认 20/10：LLM 客户端天然突发（一条请求一轮对话），20 的突发余量
+    给交互式客户端留了面子，10/s 的稳态又足以拦住打爆型流量——口径随部署调 env 即可，
+    不用改代码。配置非法（非数字/越界）响亮报错（配错喊响，同 _build_one 纪律）。
+    为什么不加工厂函数/不上 DI：与 create_provider 同一理由——这是生产装配逻辑本身，
+    测试与生产走同一条入口，测试要换限流口径时 monkeypatch 装配绑定（app.main.limiter）。
+    """
+    try:
+        capacity = float(os.environ.get("FLOWGATE_RATE_CAPACITY", "20"))
+        per_second = float(os.environ.get("FLOWGATE_RATE_PER_SECOND", "10"))
+        return RateLimiter(capacity=capacity, per_second=per_second)
+    except ValueError as exc:
+        # 行级：数字解析失败与桶参数越界都是配置错——统一指名 env 变量，排错不用猜
+        raise RuntimeError(
+            f"FLOWGATE_RATE_CAPACITY / FLOWGATE_RATE_PER_SECOND 配置非法：{exc}"
+        ) from exc
+
+
 # ===== 装配处（composition root）=====
 # 全代码库唯一允许点名具体适配器类的地方（ADR-0001）：核心路由只见 Provider 协议，
 # 换上游=改环境变量 FLOWGATE_PROVIDER，业务代码一行不动。
 provider: Provider = create_provider()
+# 限流器与上游同在装配处落座：门卫只认 RateLimiter 接口，换限流算法不惊动路由
+limiter: RateLimiter = create_limiter()
 
 app = FastAPI(
     title="FlowGate",
@@ -172,6 +197,17 @@ async def attempt_timeout_handler(request: Request, exc: AttemptTimeoutError) ->
     return JSONResponse(status_code=504, content={"detail": str(exc)})
 
 
+@app.exception_handler(RateLimitError)
+async def rate_limit_handler(request: Request, exc: RateLimitError) -> JSONResponse:
+    """空桶 429：错误说得清"该退避了"（story 12）——客户端据此退避而不是盲目重试。
+
+    为什么 429（Too Many Requests）：这是"你打得太快"而不是"上游/网关坏了"——
+    状态码本身就是重试直觉的分类器（与 502/504 同一翻译纪律，集中在这几行 handler）。
+    为什么 detail 保留容量/速率：消息里带上桶口径，客户端调试时能对出"我的节奏超了多少"。
+    """
+    return JSONResponse(status_code=429, content={"detail": str(exc)})
+
+
 @app.get("/health")
 def health() -> dict[str, str]:
     """健康检查：给探活/监控用的最小契约（200 + status=ok）。
@@ -183,14 +219,60 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
+def _bearer_key(authorization: str | None) -> str | None:
+    """从 Authorization 头取 bearer 串当限流 key；无头/空值 = 匿名（返回 None）。
+
+    不透明身份（checklist 3）：不校验格式、不查库、不撤销——凭据的生成/校验/撤销
+    是 W4 keys/ 的事，这里只把串当身份用。"Bearer " 前缀剥掉（大小写不敏感）：
+    key 是凭据串本身；非 Bearer 形态（如 Basic xxx）整段值当不透明 key——宁可把它
+    当陌生 key 限流，也不给"换个鉴权 scheme 就绕过限流"留后门。
+    """
+    if authorization is None:
+        return None
+    value = authorization.strip()
+    if not value:
+        return None
+    scheme, _, rest = value.partition(" ")  # 行级：拆"scheme 与凭据串"——只认打头的 Bearer
+    if scheme.lower() == "bearer":
+        key = rest.strip()
+        return key or None  # 行级："Bearer" 后面空空如也=没带凭据，按匿名放行
+    return value
+
+
+async def rate_limit_gate(request: Request) -> None:
+    """门卫（FastAPI 依赖）：进路由之前的一步——按 key 扣令牌，空桶抛 RateLimitError。
+
+    给初学者的解释（FastAPI 依赖在本代码库首现）：Depends(rate_limit_gate) 把本函数
+    "钉"在路由前面执行——它跑完返回 None，路由照常；它抛异常，请求到此为止，
+    路由本体（乃至上游调用）根本不会发生。门卫与路由分离，路由保持传送带（checklist 6）。
+    为什么声明 async（虽然体内没有 await）：同步依赖会被 FastAPI 丢进线程池跑，
+    async 依赖直跑事件循环——门卫是纯内存一步（扣令牌），不值得占用线程池，
+    也免了线程切换；与路由同为 async 是同一条调用约定（同 502 handler 的理由）。
+    为什么拒绝在这里就够：门卫在上游调用之前（checklist 2）——429 是零成本的，
+    桶里没令牌的请求连 fake/真上游的面都见不到。
+    key 口径（2026-10-07 用户拍板，见 ADR-0007）：key=Authorization bearer 串；
+    **匿名（无 Authorization）放行不占桶**——限流治理"每个身份不许打爆"，认证
+    （W4）管"有没有身份"；W4 把认证插在本门卫之前，此处的 key 接口一字不改。
+    """
+    key = _bearer_key(request.headers.get("authorization"))
+    if key is None:
+        return  # 行级：匿名放行不占桶——口径见 docstring，限流用例都显式带 bearer
+    limiter.acquire(key)  # 行级：空桶在此抛 RateLimitError → 异常处理器翻 429
+
+
 @app.post("/v1/chat/completions", response_model=ChatCompletionResponse)
-async def chat_completions(request: ChatRequest) -> ChatCompletionResponse | StreamingResponse:
+async def chat_completions(
+    request: ChatRequest,
+    _gate: None = Depends(rate_limit_gate),
+) -> ChatCompletionResponse | StreamingResponse:
     """对话端点（OpenAI 兼容形状）：按 request.stream 分派 JSON 整答或 SSE 流。
 
     为什么 async：下游是网络 IO（真实上游），不能堵事件循环；
     为什么形参直接用 ChatRequest：Pydantic 校验就是五站里第 2 站"输入检查"——
     形状不对 FastAPI 在进路由前就自动 422，脏请求永远到不了适配器
     （流式分支同样先过这道门，见 streaming 测试的 422 护栏）。
+    为什么有个 _gate 形参：FastAPI 依赖把限流门卫钉在路由之前（checklist 6）——
+    它不在路由体里，本体对"限流"二字零知情，仍是传送带；_ 前缀表示只接线不取值。
     为什么返回类型是联合：同一路径两种响应形状；response_model 仍钉住 JSON 腿的
     契约，而 FastAPI 对 Response 实例（StreamingResponse 及其子类）不做
     response_model 序列化——流式腿直接原样送出，两条腿互不干扰。
