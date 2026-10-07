@@ -16,13 +16,27 @@ class ChatMessage(BaseModel):
     content: str
 
 
+class StreamOptions(BaseModel):
+    """流式选项（OpenAI 兼容 stream_options）：目前只认 include_usage（issue 07）。
+
+    为什么单独一个模型不摊进 ChatRequest：stream_options 是嵌套对象形状
+    （{"include_usage": true}），摊平成顶层布尔就不是 OpenAI 兼容的报文了——
+    客户端按 OpenAI SDK 的字段名发请求，形状本身就是契约（story 22）。
+    """
+
+    # 置位时流末在 [DONE] 之前恰多发一帧 usage chunk（OpenAI 惯例）；缺省 False=零帧
+    include_usage: bool = False
+
+
 class ChatRequest(BaseModel):
-    """客户端请求体：OpenAI 形状的最小子集（model + messages + stream）。"""
+    """客户端请求体：OpenAI 形状的最小子集（model + messages + stream + stream_options）。"""
 
     model: str
     messages: list[ChatMessage]
     # 缺省 False：既有非流式客户端零改动（spec 故事 5）；True 时路由分派到 SSE 流
     stream: bool = False
+    # 流式选项（issue 07）：缺省 None=既有客户端零改动（spec 故事 25 的"纯加法"）
+    stream_options: StreamOptions | None = None
 
 
 class Usage(BaseModel):
@@ -85,3 +99,7 @@ class ChatCompletionChunk(BaseModel):
     object: str = "chat.completion.chunk"  # 固定字面量，客户端靠它区分"帧"与"整答"
     model: str
     choices: list[StreamChoice]
+    # 末帧可带官方 usage（OpenAI 的 include_usage 载体，choices 为空列表）；其余帧 None。
+    # 两个用途（issue 07）：适配器把上游的官方计数带进来（流末回填"有则用"的素材）；
+    # 网关自己在 [DONE] 前发的那帧也用这个形状——统一 chunk 一处定义，两头方言都对齐
+    usage: Usage | None = None
