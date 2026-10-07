@@ -7,8 +7,10 @@
 import pytest
 
 from app.main import create_provider
+from providers.base import Provider
 from providers.dashscope import DashScopeProvider
 from providers.fake import FakeProvider
+from routing.chain import FallbackChain
 
 
 def test_create_provider_defaults_to_fake(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -44,4 +46,35 @@ def test_create_provider_names_missing_env_var(monkeypatch: pytest.MonkeyPatch) 
     monkeypatch.delenv("DASHSCOPE_API_KEY", raising=False)
 
     with pytest.raises(RuntimeError, match="DASHSCOPE_API_KEY"):
+        create_provider()
+
+
+# ===== fallback 链装配（fallback-ratelimit-billing issue 02：逗号表=顺序链）=====
+
+
+def test_create_provider_builds_chain_from_comma_list(monkeypatch: pytest.MonkeyPatch) -> None:
+    """证明：FLOWGATE_PROVIDER 逗号表 = 顺序 fallback 链，链对上层就是一个上游（checklist 1/2）。
+
+    怎么证明：设 "fake,fake" 调 create_provider，断言拿到 FallbackChain（名字可见
+    两个成员与顺序），且仍过 isinstance(Provider)——路由继续对着协议说话。
+    单值=单元素链（退化回裸适配器）由既有三个装配测试继续钉：向后兼容一字不改。
+    """
+    monkeypatch.setenv("FLOWGATE_PROVIDER", "fake,fake")
+
+    provider = create_provider()
+
+    assert isinstance(provider, FallbackChain)
+    assert isinstance(provider, Provider)  # 行级：链对上层就是一个上游（isinstance 可验）
+    assert provider.name == "fake+fake"  # 行级：成员与顺序在链名上可见（A 先试、B 兜底）
+
+
+def test_create_provider_rejects_empty_entry_loudly(monkeypatch: pytest.MonkeyPatch) -> None:
+    """证明：逗号表里的空条目响亮报错——"fake," 这类手滑不静默装出怪链（配错喊响）。
+
+    怎么证明：设 "fake,"（尾逗号），断言 RuntimeError 且消息里点名 FLOWGATE_PROVIDER。
+    反例是跳过空条目装单链：配置现场与运行现场对不上号，悬案难查。
+    """
+    monkeypatch.setenv("FLOWGATE_PROVIDER", "fake,")
+
+    with pytest.raises(RuntimeError, match="FLOWGATE_PROVIDER"):
         create_provider()

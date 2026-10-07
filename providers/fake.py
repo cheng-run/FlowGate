@@ -25,16 +25,17 @@ from providers.base import UpstreamError
 # "拼回等于完整回显""卡在第几块"这类断言就没法写了。
 STREAM_CHUNK_COUNT = 4
 
-# 流的三种收尾方式（fake 的记账词汇）：正常耗尽 / 被掐断 / 自己抛错。
-# 被取消=GeneratorExit（aclose）或取消异常穿出生成器；断连/超时都归"被掐断"——
-# 只有"消费方取空了我们"才是正常跑完。"自己抛错"是 issue 01 失败注入加的第三种：
-# 恒失败的流抛 UpstreamError 收场，与"被取消"必须可区分——W3 断言"谁被取消了"
-# 若把失败也算进被取消，就是假绿。
+# 收尾账的词汇（两腿同族）：正常跑完 / 被掐断 / 自己抛错——stream_endings 记流式
+# 生成器的收场，chat_endings 记非流式协程的收场（issue 02 扩账到非流式腿，词汇不变）。
+# 被取消=GeneratorExit（aclose）或取消异常穿出；断连/超时都归"被掐断"——
+# 只有"消费方取空了我们 / 正常返回"才是正常跑完。"自己抛错"是 issue 01 失败注入
+# 加的第三种：恒失败抛 UpstreamError 收场，与"被取消"必须可区分——W3 断言
+# "谁被取消了"若把失败也算进被取消，就是假绿。
 # 为什么测试断言用字面量不用这些常量：字面量是独立真源——常量改名或取值撞车
 # 时测试必须红（防"断言永远为真"的假绿），这是刻意的词汇分家，不是漏用。
-STREAM_COMPLETED = "completed"
-STREAM_CANCELLED = "cancelled"
-STREAM_FAILED = "failed"
+ENDING_COMPLETED = "completed"
+ENDING_CANCELLED = "cancelled"
+ENDING_FAILED = "failed"
 
 # 失败形态词汇（issue 01 注入面）：fake 按注入的形态**按需失败**。
 # 三种形态对应 W3 fallback 要仿真的三类上游死法：恒失败（拒答/5xx，换路信号）、
@@ -112,54 +113,75 @@ class FakeProvider:
         # 行级：恒失败消息在构造时定死一条，两腿共用——"非流式与流式失败行为一致"
         # 由构造保证，不靠两条腿各自拼消息时"恰好拼得一样"（checklist 5 的地基）
         self._fail_message = f"上游 {self.name} 返回 500: fake 注入的恒失败形态"
-        # 收尾记录：每条流结束（正常跑完/被取消/自己抛错）追加一条——02"断连不泄漏"
+        # 收尾记录：每条流结束（正常跑完/被取消/自己抛错）追加一条——W2-02"断连不泄漏"
         # 断言的地基。为什么记在实例上：断言要在流生死之外事后查账，实例账本最直白
         # （fake 就是测试设施，"谁被取消了"按实例查账，W3 断言靠这个）。
-        # 口径（评审裁决点）：这本账记**生成器的收场方式**，不记语义上的成败——
+        # 口径（评审裁决点）：账本记**收场方式**，不记语义上的成败——
         # 空流"一言不发地走到头"记 completed，它的"失败身份"由 seam 承担
-        # （streaming/sse 把空流翻成 UpstreamError → 502）；非流式腿没有收尾账，
-        # 失败当场以异常可见（"来过"由 calls 记）。两套词汇各管一事，走读照此讲。
+        # （streaming/sse 把空流翻成 UpstreamError → 502）。
         self.stream_endings: list[str] = []
+        # 非流式收尾账（issue 02 扩账）：与 stream_endings 同一词汇、同一"宁冤勿纵"
+        # 口径。issue 01 曾定"非流式无收尾账"（失败/完成当场可见）——W3 fallback 要断言
+        # "放弃的尝试被显式取消、非干等烧钱"，而"被取消"恰是 chat() 唯一看不见的收场，
+        # 必须由 fake 记账作证（现实赢：此口径取代 issue 01 的裁决点，词汇不变）。
+        self.chat_endings: list[str] = []
         # 调用记录：每条腿开工记一笔方法名（"chat" / "chat_stream"）——"谁被调用了
         # 几次"按实例数 len(calls)。流式腿在生成器**开工**（首块被消费）才记：
         # async 生成器创建时不执行函数体（语义见 base.py），没被消费的流不算调用
         self.calls: list[str] = []
 
+    # 拆不动说明（chat 整块超 40 行，含 docstring/注释；同 chat_stream 的先例）：
+    # 收尾账的 try/finally 必须罩住整段收场判定——响应构造、失败注入、卡住等待是
+    # 同一条"收场链"的走读现场，抽小函数会把"ending 何时改判"拆到两处对照着读，
+    # 收尾记账的现场反而讲不清，故保持单函数，超限以本说明豁免。
     async def chat(self, request: ChatRequest) -> ChatCompletionResponse:
         """回显式回答：证明请求内容穿过了 seam，而不是 fake 自说自话。
 
         为什么回显而不是固定句：固定句测不出"请求真的传进来了"——
         回显让"数据流穿过适配器"这件事变得可断言。
+        收尾账（issue 02）：与 chat_stream 同款"默认记被取消、正常答完才改判"——
+        记账在 finally 里纯同步一步跑完，取消传播途中也执行、不悬垂。
         """
         self.calls.append("chat")  # 行级：开工记账——失败/成功都先记"来过"（checklist 4）
-        # 行级：恒失败注入（issue 01）——先于任何正常路径产物抛出；失败消息与流式腿
-        # 同一条（构造时定死），两腿失败行为一致（checklist 5）
-        if self._failure == FAILURE_FAIL:
-            raise UpstreamError(self._fail_message)
-        # 行级：卡住注入（issue 01）——悬在产出之前；取消落在 _hang 的等待点上
-        if self._failure == FAILURE_HANG:
-            await self._hang()
-        # 行级：取最后一条消息做回显素材——多轮请求里最新输入最能代表"内容传进来了"。
-        last_user = request.messages[-1].content
-        # 行级：空流注入在非流式腿的讲法是"空答复"——一言不发（checklist 5）；
-        # 其余形态走到这里就是正常回显（恒失败/卡住在上面就已拦掉）
-        content = "" if self._failure == FAILURE_EMPTY else f"fake-reply: {last_user}"
+        # 行级：默认记"被取消"（宁冤勿纵）：只有完整答完/自己抛错才改判——
+        # 卡住被 cancel 时 ending 恰好停在这个默认值，就是现场的正确答案
+        ending = ENDING_CANCELLED
+        try:
+            # 行级：恒失败注入（issue 01）——先于任何正常路径产物抛出；失败消息与流式腿
+            # 同一条（构造时定死），两腿失败行为一致（checklist 5）
+            if self._failure == FAILURE_FAIL:
+                ending = ENDING_FAILED  # 行级：失败 ≠ 被取消，账本要能分开数
+                raise UpstreamError(self._fail_message)
+            # 行级：卡住注入（issue 01）——悬在产出之前；取消落在 _hang 的等待点上
+            if self._failure == FAILURE_HANG:
+                await self._hang()
+            # 行级：取最后一条消息做回显素材——多轮请求里最新输入最能代表"内容传进来了"。
+            last_user = request.messages[-1].content
+            # 行级：空流注入在非流式腿的讲法是"空答复"——一言不发（checklist 5）；
+            # 其余形态走到这里就是正常回显（恒失败/卡住在上面就已拦掉）
+            content = "" if self._failure == FAILURE_EMPTY else f"fake-reply: {last_user}"
 
-        return ChatCompletionResponse(
-            id=f"{self.name}-{uuid.uuid4().hex[:8]}",  # id 唯一且带实例名；形状对齐 OpenAI
-            model=request.model,  # 回显请求里的模型名：证明请求字段流进了适配器
-            choices=[
-                Choice(
-                    index=0,
-                    message=ChatMessage(
-                        role="assistant",  # 固定 assistant：OpenAI 形状的硬约定
-                        content=content,
-                    ),
-                    finish_reason="stop",
-                )
-            ],
-            usage=Usage(),  # 计数归 billing/（W3），fake 回 0，不装懂
-        )
+            response = ChatCompletionResponse(
+                id=f"{self.name}-{uuid.uuid4().hex[:8]}",  # id 唯一且带实例名；形状对齐 OpenAI
+                model=request.model,  # 回显请求里的模型名：证明请求字段流进了适配器
+                choices=[
+                    Choice(
+                        index=0,
+                        message=ChatMessage(
+                            role="assistant",  # 固定 assistant：OpenAI 形状的硬约定
+                            content=content,
+                        ),
+                        finish_reason="stop",
+                    )
+                ],
+                usage=Usage(),  # 计数归 billing/（W3），fake 回 0，不装懂
+            )
+            ending = ENDING_COMPLETED  # 行级：走到返回 = 正常答完，改判收场方式
+            return response
+        finally:
+            # 收尾落账（issue 02"放弃的尝试被显式取消"断言的地基）：正常答完/被取消/
+            # 自己抛错都从这记一笔。纯同步一步跑完，取消传播途中也执行，不给 GC 留时机。
+            self.chat_endings.append(ending)
 
     # 拆不动说明（chat_stream 整块超 40 行，含注释）：帧序列+闸门+收尾记账是同一条
     # 取消传播链的走读现场，抽子生成器会把链条拆成两截（内层还得再显式 aclose 一次——
@@ -179,18 +201,18 @@ class FakeProvider:
         gate = self._stream_gate()
         # 默认记"被取消"：只有完整吐完/自己抛错才改判——收尾账本宁冤勿纵，
         # 防"断言永远为真"的假绿（02 checklist 2：三种收尾必须可区分）
-        ending = STREAM_CANCELLED
+        ending = ENDING_CANCELLED
         try:
             # 行级：恒失败注入（issue 01）——首块前抛，正是 W3"可报错窗口/重试窗口"
             # 依赖的失败时机；收尾记 "failed"：失败 ≠ 被取消，账本要能分开数
             if self._failure == FAILURE_FAIL:
-                ending = STREAM_FAILED
+                ending = ENDING_FAILED
                 raise UpstreamError(self._fail_message)
             # 行级：空流注入（issue 01）——零块直接收场；收尾记"正常跑完"（账本记
             # 收场方式、不记语义成败，裁决口径见 stream_endings 注释）——它的
             # "失败身份"在 seam 上兑现：sse_response 把空流翻成 UpstreamError → 502
             if self._failure == FAILURE_EMPTY:
-                ending = STREAM_COMPLETED
+                ending = ENDING_COMPLETED
                 return
             # 行级：卡住注入（issue 01）——悬在首块之前；取消穿进来时 ending 停留在
             # 默认的"被取消"（宁冤勿纵的默认值恰好就是这里的正确答案）
@@ -222,7 +244,7 @@ class FakeProvider:
             await self._pass_gate(gate)
             yield _chunk(chunk_id, request.model, finish_reason="stop")
             # 走到这里 = 消费方又取了一次而我们没有了——生成器正常耗尽，改判"正常跑完"
-            ending = STREAM_COMPLETED
+            ending = ENDING_COMPLETED
         finally:
             # 收尾落账（02 断言的地基）：正常跑完/被取消/自己抛错都从这记一笔。
             # 被取消 = GeneratorExit（aclose）或取消异常穿出本生成器——记账是纯同步代码，

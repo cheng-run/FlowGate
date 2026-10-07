@@ -224,3 +224,36 @@ def test_unknown_failure_mode_rejected_loudly() -> None:
     """
     with pytest.raises(ValueError, match="always-fail"):
         FakeProvider(failure="always-fail")
+
+
+# ===== 切片 E：非流式收尾账（fallback-ratelimit-billing issue 02）=====
+
+
+async def test_chat_endings_record_completed_failed_and_cancelled() -> None:
+    """证明：非流式腿收尾账与流式同一词汇（completed / failed / cancelled）——
+    "放弃的尝试显式取消上游（fake 记录'被取消'）"的可断言面（issue 02 checklist）。
+
+    怎么证明：三个实例分别走三条收场路——正常答完、恒失败抛错、卡住被显式取消——
+    断言 chat_endings 各记恰好一条且字面量对号入座。为什么非流式也要收尾账
+    （issue 01 曾定"非流式无收尾账"）：失败/完成当场以异常/返回值可见，唯有
+    "被取消"看不见——fallback 链放弃卡住的尝试时显式 cancel 上游，fake 记下
+    "被取消"就是"取消真落进了上游代码、而不是干等它烧钱"的证据。
+    """
+    ok = FakeProvider()
+    await ok.chat(_make_request())
+
+    bad = FakeProvider(failure="fail")
+    with pytest.raises(UpstreamError):
+        await bad.chat(_make_request())
+
+    # 行级：create_task 让 chat() 悬在挂起点上，才能取消它（同步调用只能等到返回）
+    hung = FakeProvider(failure="hang")
+    task = asyncio.create_task(hung.chat(_make_request()))
+    await asyncio.wait({task}, timeout=0.1)  # 行级：等它真的挂上（上限兜底，零真实 sleep）
+    task.cancel()  # 行级：显式取消——fallback 链"放弃尝试"的同款现场
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert ok.chat_endings == ["completed"]
+    assert bad.chat_endings == ["failed"]
+    assert hung.chat_endings == ["cancelled"]

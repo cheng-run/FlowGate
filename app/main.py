@@ -15,23 +15,43 @@ from app.schemas import ChatCompletionResponse, ChatRequest
 from providers.base import Provider, UpstreamError
 from providers.dashscope import DEFAULT_BASE_URL, DashScopeProvider
 from providers.fake import FakeProvider
+from routing.chain import AttemptTimeoutError, FallbackChain
+from routing.request_id import new_request_id, request_id_var
 from streaming.sse import GapTimeoutError, sse_response
 
 
 def create_provider() -> Provider:
-    """装配处核心：按环境变量选上游实例（spec 故事 5，默认 fake）。
+    """装配处核心：按环境变量装上游——逗号表 = 顺序 fallback 链（issue 02，默认 fake）。
 
     这是生产装配逻辑本身，不是"为测试加的钩子"（spec 决定：不加工厂函数/不上 DI）——
     选择逻辑无论放哪都得有个名字可调，写成函数只是把装配决策显式化；
     它不接收任何注入参数，测试与生产走同一条入口。
+    逗号表口径（checklist 2）：FLOWGATE_PROVIDER=a,b = a 先试、a 挂 b 接管；
+    **单值即单元素链**——退化回上游本身，历史行为一字不差（向后兼容：既有装配测试的
+    isinstance(create_provider(), FakeProvider) 断言不改仍绿）。
     读环境为什么不引 python-dotenv：uv 的 `--env-file .env` 启动时注入环境，
     代码只读 os.environ——零新增依赖（依赖红线：能零依赖就不引库）。
     """
     # 上游选择：FLOWGATE_PROVIDER 缺省 fake——无 key 也能跑测试与演示
     choice = os.environ.get("FLOWGATE_PROVIDER", "fake")
-    if choice == "fake":
+    # 复杂语句（推导式）行上：逗号切表、去空白——顺序即 fallback 优先级
+    names = [part.strip() for part in choice.split(",")]
+    # 复杂语句（推导式）行上：逐条装成上游实例（未知/空条目在 _build_one 里响亮报错）
+    providers = [_build_one(name, choice) for name in names]
+    if len(providers) == 1:
+        return providers[0]  # 行级：单元素链退化为上游本身（向后兼容的字面兑现）
+    return FallbackChain(providers)
+
+
+def _build_one(name: str, choice: str) -> Provider:
+    """装一个上游实例——全代码库唯一点名具体适配器类的函数（ADR-0001）。
+
+    为什么拆出来：逗号表要逐条装配，if-ladder 收在这里，"点名适配器"仍只在
+    装配处一处；未知取值/空条目响亮报错（配错喊响），消息带原始 choice 供定位。
+    """
+    if name == "fake":
         return FakeProvider()
-    if choice == "dashscope":
+    if name == "dashscope":
         # 缺 key 必须响亮且指名（故事 10）：静默降级回 fake 会让
         # "我明明配了真上游，怎么答的还是回显"变成难查的悬案。
         api_key = os.environ.get("DASHSCOPE_API_KEY", "")
@@ -43,8 +63,10 @@ def create_provider() -> Provider:
         # base_url 可覆盖（默认官方 OpenAI 兼容前缀）：接中转/代理靠这个口子
         base_url = os.environ.get("DASHSCOPE_BASE_URL", DEFAULT_BASE_URL)
         return DashScopeProvider(api_key=api_key, base_url=base_url)
-    # 未知取值同样响亮报错：拼错的上游名若静默回 fake，配置就形同虚设
-    raise RuntimeError(f"未知的 FLOWGATE_PROVIDER={choice!r}（可选：fake / dashscope）")
+    # 未知取值（含空条目）同样响亮报错：拼错的上游名若静默回 fake，配置就形同虚设
+    raise RuntimeError(
+        f"未知的上游 {name!r}（FLOWGATE_PROVIDER={choice!r}；可选：fake / dashscope）"
+    )
 
 
 # ===== 装配处（composition root）=====
@@ -56,6 +78,57 @@ app = FastAPI(
     title="FlowGate",
     version="0.1.0",
 )
+
+
+class RequestIdMiddleware:
+    """ASGI 中间件：进门发号、响应挂号（X-Request-Id）——每逻辑请求一个对账号。
+
+    给初学者的解释（纯 ASGI 中间件在本代码库首次出现）：ASGI 应用就是一个
+    async def __call__(scope, receive, send) 的可调用对象；中间件包一层，在 send
+    拦下"响应头那条消息"（http.response.start）补一个头，响应体/断连消息原样放行——
+    W2 的流生命周期（逐块搬运、断连清理）因此一字不动。
+    为什么不用 FastAPI 的 @app.middleware("http")：那走 BaseHTTPMiddleware，会接管
+    响应体的逐块搬运（多一层内存流）——W2"断连不泄漏"建立在体不经第二人之手上，
+    为加个响应头去动流的搬运路径得不偿失。
+    为什么发号在进门：号要先于路由存在——将来限流/预算门卫（进路由之前的一步）与
+    billing 结算都按它对账；fallback 链的 attempts 直接取用，同一请求永不二号。
+    """
+
+    def __init__(self, app) -> None:
+        """持有被包裹的 ASGI 应用（Starlette 以 app= 关键字注入）。"""
+        self.app = app
+
+    async def __call__(self, scope, receive, send) -> None:
+        """HTTP 请求进门发号并绑进 ContextVar；响应头带号；出门还原背包。"""
+        if scope["type"] != "http":
+            # 行级：lifespan 等非 HTTP scope 不是"逻辑请求"——不发号、不碰，原样放行
+            await self.app(scope, receive, send)
+            return
+        request_id = new_request_id()
+        token = request_id_var.set(request_id)  # 行级：号放进"隐形背包"，链里伸手取
+
+        async def send_with_request_id(message: dict) -> None:
+            """替身 send：只改 http.response.start（补 X-Request-Id），其余消息原样放行。"""
+            if message["type"] == "http.response.start":
+                # 行级：headers 是 [(b"名", b"值"), …] 的列表——追加一项即挂号；
+                # 复制出新消息而不是就地改，不惊动上游应用可能复用的消息对象
+                message = {
+                    **message,
+                    "headers": [
+                        *message.get("headers", ()),
+                        (b"x-request-id", request_id.encode()),
+                    ],
+                }
+            await send(message)
+
+        try:
+            await self.app(scope, receive, send_with_request_id)
+        finally:
+            # 行级：出门还原背包——同一任务若复用（测试里连续请求），号不串门
+            request_id_var.reset(token)
+
+
+app.add_middleware(RequestIdMiddleware)
 
 
 @app.exception_handler(UpstreamError)
@@ -82,6 +155,19 @@ async def gap_timeout_handler(request: Request, exc: GapTimeoutError) -> JSONRes
     为什么只有首块前会走到这：首块后同一条件在 streaming/ 里就地截断（流已承诺、
     200 已发出），异常根本不会穿到 HTTP 层——本 handler 就是"可报错窗口"的出口，
     窗口在首块处关闭（W3"重试窗口限死在首 token 之前"的契约面）。
+    """
+    return JSONResponse(status_code=504, content={"detail": str(exc)})
+
+
+@app.exception_handler(AttemptTimeoutError)
+async def attempt_timeout_handler(request: Request, exc: AttemptTimeoutError) -> JSONResponse:
+    """尝试预算超时（非流式超时族成员）→ 504，与 gap 超时同一语义出口（issue 02）。
+
+    为什么与 gap 超时同翻 504：超时族的语义都是"上游没按时说话"——504 一个出口，
+    客户端重试直觉一致；族成员分开两类只为失败词汇精确（gap=块间预算，attempt=
+    非流式尝试预算，一个词只说一件事）。为什么翻译集中在这里：路由保持传送带，
+    失败翻译只在这几行 handler（本文件上游错误 handler 的注释早就预告过——
+    "将来接 fallback/重试（W3）时改动点也在这"）。
     """
     return JSONResponse(status_code=504, content={"detail": str(exc)})
 
