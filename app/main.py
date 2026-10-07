@@ -19,6 +19,7 @@ from billing.settlement import BillingProvider
 from providers.base import Provider, UpstreamError
 from providers.dashscope import DEFAULT_BASE_URL, DashScopeProvider
 from providers.fake import FakeProvider
+from providers.kimi import KimiProvider
 from ratelimit.bucket import RateLimiter, RateLimitError
 from routing.chain import AttemptTimeoutError, FallbackChain
 from routing.request_id import new_request_id, request_id_var
@@ -53,6 +54,11 @@ def _build_one(name: str, choice: str) -> Provider:
 
     为什么拆出来：逗号表要逐条装配，if-ladder 收在这里，"点名适配器"仍只在
     装配处一处；未知取值/空条目响亮报错（配错喊响），消息带原始 choice 供定位。
+    拆不动说明（函数物理行数超 40，含 docstring/注释；同 routing/chain.py 先例）：
+    if-ladder 就是"唯一点名适配器"的机制本体——拆成每上游一个小函数会把点名面
+    摊到多处，抽 _require_env 通用助手则把各档的配置故事（dashscope 的 base_url
+    有默认 / kimi 双必填，这个不对称是刻意的）藏进第三处；教学注释是规范硬要求
+    删不得，行数超限以本说明豁免。
     """
     if name == "fake":
         return FakeProvider()
@@ -68,9 +74,28 @@ def _build_one(name: str, choice: str) -> Provider:
         # base_url 可覆盖（默认官方 OpenAI 兼容前缀）：接中转/代理靠这个口子
         base_url = os.environ.get("DASHSCOPE_BASE_URL", DEFAULT_BASE_URL)
         return DashScopeProvider(api_key=api_key, base_url=base_url)
+    if name == "kimi":
+        # 缺 key 必须响亮且指名（沿 ADR-0002 纪律，与 dashscope 同款）：静默降级回
+        # fake 会让"我明明配了 kimi，怎么答的还是回显"变成难查的悬案
+        api_key = os.environ.get("KIMI_API_KEY", "")
+        if not api_key:
+            raise RuntimeError(
+                "FLOWGATE_PROVIDER=kimi 但缺少环境变量 KIMI_API_KEY"
+                "（写入 .env，用 uv run --env-file .env 启动）"
+            )
+        # base_url 同样必填、无内置默认（Kimi 与 DashScope 的不对称是刻意的）：Kimi 走
+        # 私有中转，真实地址只活在 .env（issue 08 checklist"真实地址永不进 git"）——
+        # 内置默认地址就是猜，猜错（拿中转 key 打官方地址）是运行期 401 的静默悬案
+        base_url = os.environ.get("KIMI_BASE_URL", "")
+        if not base_url:
+            raise RuntimeError(
+                "FLOWGATE_PROVIDER=kimi 但缺少环境变量 KIMI_BASE_URL"
+                "（真实中转地址写入 .env，不入 git；用 uv run --env-file .env 启动）"
+            )
+        return KimiProvider(api_key=api_key, base_url=base_url)
     # 未知取值（含空条目）同样响亮报错：拼错的上游名若静默回 fake，配置就形同虚设
     raise RuntimeError(
-        f"未知的上游 {name!r}（FLOWGATE_PROVIDER={choice!r}；可选：fake / dashscope）"
+        f"未知的上游 {name!r}（FLOWGATE_PROVIDER={choice!r}；可选：fake / dashscope / kimi）"
     )
 
 

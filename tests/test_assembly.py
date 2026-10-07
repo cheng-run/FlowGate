@@ -13,6 +13,7 @@ from app.schemas import Usage
 from providers.base import Provider
 from providers.dashscope import DashScopeProvider
 from providers.fake import FakeProvider
+from providers.kimi import KimiProvider
 from ratelimit.bucket import RateLimitError
 from routing.chain import FallbackChain
 
@@ -161,3 +162,69 @@ def test_create_ledger_reads_db_path_env(monkeypatch: pytest.MonkeyPatch) -> Non
         official_usage=Usage(prompt_tokens=1, completion_tokens=1, total_tokens=2),
     )
     assert ledger.spend("sk-env") == 2  # 行级：装配出来的账本可读可写——不是摆设
+
+
+# ===== Kimi 装配（fallback-ratelimit-billing issue 08：第二真实上游加一档）=====
+
+
+def test_create_provider_selects_kimi_when_configured(monkeypatch: pytest.MonkeyPatch) -> None:
+    """证明：FLOWGATE_PROVIDER=kimi 装出 Kimi 适配器——第二真实上游接线零新机制（故事 23）。
+
+    怎么证明：设 kimi + 两个必需环境变量后调 create_provider，断言拿到 KimiProvider
+    实例。与 dashscope 的同名测试同款：换上游=改配置不改代码（ADR-0001 seam 的
+    装配侧证据），Kimi 走的是同一个 if-ladder，不是特例通道。
+    """
+    monkeypatch.setenv("FLOWGATE_PROVIDER", "kimi")
+    monkeypatch.setenv("KIMI_API_KEY", "sk-test")
+    monkeypatch.setenv("KIMI_BASE_URL", "https://kimi-relay.test/v1")
+
+    assert isinstance(create_provider(), KimiProvider)
+
+
+def test_create_provider_names_missing_kimi_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    """证明：选 kimi 却没 key → 报错指名 KIMI_API_KEY（缺配置响亮且具体，沿 ADR-0002 纪律）。
+
+    怎么证明：设 kimi、给 base_url、清 key，断言 RuntimeError 的消息里含变量名。
+    反例是静默降级回 fake——用户看着回显纳闷"我明明配了 kimi"，悬案难查。
+    """
+    monkeypatch.setenv("FLOWGATE_PROVIDER", "kimi")
+    monkeypatch.delenv("KIMI_API_KEY", raising=False)
+    monkeypatch.setenv("KIMI_BASE_URL", "https://kimi-relay.test/v1")
+
+    with pytest.raises(RuntimeError, match="KIMI_API_KEY"):
+        create_provider()
+
+
+def test_create_provider_names_missing_kimi_base_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    """证明：KIMI_BASE_URL 也是必需项，缺了报错指名——真实中转地址只活在 .env（checklist 4）。
+
+    怎么证明：设 kimi、给 key、清 base_url，断言 RuntimeError 的消息里含变量名。
+    为什么 base_url 必填而不内置默认（DashScope 的不对称是刻意的）：Kimi 走私有
+    中转，没有可猜的公开默认地址——猜错（拿中转 key 打官方地址）是运行期 401 的
+    静默悬案；缺配置在启动时报错指名，比运行期猜地址诚实（providers/kimi.py 同述）。
+    """
+    monkeypatch.setenv("FLOWGATE_PROVIDER", "kimi")
+    monkeypatch.setenv("KIMI_API_KEY", "sk-test")
+    monkeypatch.delenv("KIMI_BASE_URL", raising=False)
+
+    with pytest.raises(RuntimeError, match="KIMI_BASE_URL"):
+        create_provider()
+
+
+def test_create_provider_builds_real_dual_upstream_chain(monkeypatch: pytest.MonkeyPatch) -> None:
+    """证明：dashscope,kimi 逗号表装出真实双上游链——"双上游"是生产形态不是 fake 演习
+    （story 23 / checklist 6 的装配侧）。
+
+    怎么证明：设 "dashscope,kimi" + 三份环境变量，断言拿到 FallbackChain 且链名
+    "dashscope+kimi"（顺序即优先级：DashScope 先试、Kimi 兜底），并过 isinstance(Provider)。
+    链的行为（接管/换路）由 routing 测试与真网 live smoke 共钉，这里只钉装配形状。
+    """
+    monkeypatch.setenv("FLOWGATE_PROVIDER", "dashscope,kimi")
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "sk-test-ds")
+    monkeypatch.setenv("KIMI_API_KEY", "sk-test-kimi")
+    monkeypatch.setenv("KIMI_BASE_URL", "https://kimi-relay.test/v1")
+
+    provider = create_provider()
+
+    assert isinstance(provider, FallbackChain)
+    assert provider.name == "dashscope+kimi"  # 行级：成员与顺序在链名上可见——真实双上游
