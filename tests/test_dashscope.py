@@ -13,7 +13,7 @@ import httpx
 import pytest
 
 from app.schemas import ChatMessage, ChatRequest
-from providers.base import Provider, UpstreamError
+from providers.base import Provider, TransientUpstreamError, UpstreamError
 from providers.dashscope import DashScopeProvider
 
 # 测试专用的假 key / 假地址：只进 mock 断言，永不触网
@@ -156,3 +156,23 @@ async def test_dashscope_chat_wraps_transport_failure_as_upstream_error() -> Non
 
     # 类型断言=失败翻译进协议；内容断言=根因不被吞——排错时"为什么连不上"必须可读
     assert "connection refused" in str(exc_info.value)
+
+
+async def test_dashscope_chat_transport_failure_carries_transient_shape() -> None:
+    """证明：连接失败携带**可重试**形状——"连接失败可重试"在生产路径成立，不只在测试桩上。
+
+    怎么证明：假上游 handler 抛 ConnectError，断言 chat() 抛的是
+    TransientUpstreamError（UpstreamError 的瞬态子类：同 502 出口、但链会重试 1 次）。
+    反例是传输层失败与拒答共用一个形状：链分不出"够不着"（毛刺，该重试）与
+    "被拒了"（判决，该换路），checklist 1 的"连接失败可重试"就只剩桩上成立。
+    """
+
+    def refuse_connection(request: httpx.Request) -> httpx.Response:
+        """假上游连不上：handler 抛异常等价于真网络的连接失败。"""
+        raise httpx.ConnectError("connection refused")
+
+    with pytest.raises(TransientUpstreamError) as exc_info:
+        await _make_provider(refuse_connection).chat(_make_request())
+
+    assert isinstance(exc_info.value, UpstreamError)  # 行级：仍属答不上族——502 出口不变
+    assert "connection refused" in str(exc_info.value)  # 行级：根因原文不丢

@@ -11,7 +11,7 @@ from collections.abc import AsyncIterator
 import httpx
 
 from app.schemas import ChatCompletionChunk, ChatCompletionResponse, ChatRequest
-from providers.base import UpstreamError
+from providers.base import TransientUpstreamError, UpstreamError
 
 # DashScope 的 OpenAI 兼容前缀（官方文档口径）：/chat/completions 挂在它下面。
 # 做成常量而非硬编码进方法：DASHSCOPE_BASE_URL 可覆盖（接中转、测试都靠这个口子）。
@@ -67,7 +67,9 @@ class DashScopeProvider:
             # 行级：传输层失败（超时/拒连/DNS 失败）同样翻译进协议异常（故事 6）——
             # 裸 httpx 异常会变成网关自己的 500，客户端分不清"网关坏了"还是"够不着上游"。
             # TransportError 是超时(TimeoutException)与连接错误的共同父类，一次接住。
-            raise UpstreamError(f"上游 {self.name} 请求失败: {exc}") from exc
+            # 瞬态形状（issue 04）：够不着上游=毛刺不是判决——链重试 1 次再换路；
+            # 仍属 UpstreamError 族（子类），502 出口与既有语义一字不动。
+            raise TransientUpstreamError(f"上游 {self.name} 请求失败: {exc}") from exc
         # 行级：失败翻译点（wire → 协议异常）。非 2xx 绝不静默、也不当成功解析——
         # 上游的错误报文长得像 JSON 但没有 choices，硬解析会炸出误导性的 500。
         # 摘要截断 500 字符：错误页可能巨长，detail 要能一眼读完（spec：保留上游响应摘要）。
@@ -126,7 +128,8 @@ class DashScopeProvider:
             # 变成网关 500，客户端分不清"网关坏了"还是"够不着上游"。与 chat() 的同名
             # 翻译**有意双写**（措辞一字不差）：两条腿各自的失败翻译都留在各自现场走读，
             # 抽公共小函数省 3 行却把"失败形状在哪翻的"藏进第三处（chat() docstring 同理）
-            raise UpstreamError(f"上游 {self.name} 请求失败: {exc}") from exc
+            # 瞬态形状（issue 04）与 chat() 同款：毛刺可重试，502 出口不变
+            raise TransientUpstreamError(f"上游 {self.name} 请求失败: {exc}") from exc
 
     async def _iter_unified_chunks(
         self, lines: AsyncIterator[str]

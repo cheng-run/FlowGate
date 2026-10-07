@@ -18,6 +18,21 @@ class UpstreamError(Exception):
     这个异常类型，翻译成 HTTP 502 时永远不需要认识 DashScope 的错误 JSON——
     这与"核心只见协议不见实现"（ADR-0001）是同一条纪律的两面。
     消息内容约定：状态码 + 上游响应摘要，让客户端能分辨 key 错 / 请求错 / 上游挂。
+    失败分类（issue 04 起）：**光杆** UpstreamError = 拒答类（请求性失败/坏帧/空流，
+    不重试、直接换路）；瞬态成员见 TransientUpstreamError。
+    """
+
+
+class TransientUpstreamError(UpstreamError):
+    """瞬态失败（连接失败/上游自带超时）——与拒答同族，但**可重试 1 次**（issue 04）。
+
+    为什么是 UpstreamError 的子类而不是另立顶级类：它同样是"上游答不上"、同样
+    502 出口、同样当换路信号——is-a 关系成立，既有 pytest.raises(UpstreamError)
+    与 502 异常处理器一字不改地继续接住它（回归绿线靠这个）。区别只在**策略**：
+    链对它同上游重试 1 次再换路（毛刺被吸收），对光杆 UpstreamError（拒答）
+    不重试、直接换路（重试请求性失败只是浪费预算）。判定看 isinstance 子类，
+    attempts 账本记真实类名（"形状说话"的原料）。
+    消息内容约定：失败种类（连接失败/超时）+ 根因原文，与 UpstreamError 同款。
     """
 
 

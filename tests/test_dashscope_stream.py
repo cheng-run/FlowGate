@@ -17,7 +17,7 @@ from fastapi.testclient import TestClient
 # 导入装配好的 app：端到端跑的是真实应用（含装配处），与 chat 端点测试同一高度。
 from app.main import app
 from app.schemas import ChatCompletionChunk, ChatMessage, ChatRequest
-from providers.base import UpstreamError
+from providers.base import TransientUpstreamError, UpstreamError
 from providers.dashscope import DashScopeProvider
 
 client = TestClient(app)
@@ -209,6 +209,27 @@ async def test_dashscope_stream_wraps_transport_failure_as_upstream_error() -> N
 
     # 类型断言=失败翻译进协议；内容断言=根因不被吞——"为什么连不上"必须可读
     assert "connection refused" in str(exc_info.value)
+
+
+async def test_dashscope_stream_transport_failure_carries_transient_shape() -> None:
+    """证明：流式腿的连接失败同样携带**可重试**形状——与非流式同一失败分类（issue 04）。
+
+    怎么证明：假上游 handler 抛 ConnectError，断言 chat_stream 抛的是
+    TransientUpstreamError（瞬态子类：链在换路窗口里重试 1 次）。与 chat() 的同名
+    测试同一口径（两腿有意双写翻译、词汇不分家）：反例是流式腿把毛刺当拒答，
+    同一请求两种消费方式的重试行为分叉（故事 2）。
+    """
+
+    def refuse_connection(request: httpx.Request) -> httpx.Response:
+        """假上游连不上：handler 抛异常等价于真网络的连接失败（test_dashscope 同款）。"""
+        raise httpx.ConnectError("connection refused")
+
+    with pytest.raises(TransientUpstreamError) as exc_info:
+        # 复杂语句（async 推导式）行上：把整条流消费干净——瞬态失败在开工时抛出，必须吃到它
+        [c async for c in _make_provider(refuse_connection).chat_stream(_make_request())]
+
+    assert isinstance(exc_info.value, UpstreamError)  # 行级：仍属答不上族——502 出口不变
+    assert "connection refused" in str(exc_info.value)  # 行级：根因原文不丢
 
 
 async def test_dashscope_stream_raises_upstream_error_on_malformed_data_line() -> None:
