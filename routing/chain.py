@@ -1,4 +1,4 @@
-"""fallback 链门面：把一串上游装成**一个** Provider（W3 issue 02，链本体）。
+"""fallback 链门面：把一串上游装成**一个** Provider（W3 issue 02 非流式 / 03 流式）。
 
 为什么链要满足 Provider 协议：链对上层就是一个上游——路由本体零改动仍是传送带
 （ADR-0001 的 deep module：新增"接治理"不新增接口面）。attempts 列表是链的观测面：
@@ -45,6 +45,33 @@ async def _call(provider: Provider, request: ChatRequest) -> ChatCompletionRespo
     except TimeoutError as exc:
         # 行级：归"上游答不上"族（与拒答同族）——不是"预算到了"（尝试超时）
         raise UpstreamError(f"上游 {provider.name} 调用时抛出 TimeoutError: {exc}") from exc
+
+
+async def _fetch_first(
+    stream: AsyncIterator[ChatCompletionChunk], upstream: str
+) -> ChatCompletionChunk:
+    """裸取上游流的首块：上游自带的 TimeoutError 换成 UpstreamError——首块前可现形失败的统一入口。
+
+    为什么说"可现形"（评审收严）：拒答/空流/自带超时在这里变成异常现形；挂起类
+    失败（一言不发地悬着）不会现形——放弃卡住的尝试要预算尺（尝试预算 + 显式
+    取消），那是 issue 04 的票面，本票不预支半套预算。
+    为什么需要这层隔离（同 _call / streaming._fetch 的词汇纪律）：将来尝试预算的
+    闹钟（issue 04）抛的 TimeoutError 说的是"预算到了"（换路信号）；若适配器自己
+    漏出 builtin TimeoutError，两款会同款到达 except，会被误标成"预算放弃"——
+    先在这换掉上游的，外面的失败词汇就只认 UpstreamError 一种形状（ADR-0004 决定 3）。
+    为什么空流也在这翻成 UpstreamError（W2 空流口径延续到链上）：上游一言不发地
+    走完，对客户端没有任何可答复的内容——单上游路径 sse_response 翻 UpstreamError
+    → 502，链上这是**换路信号**（A 空流，B 还能答）；词汇仍是一族，不另造异常。
+    """
+    try:
+        # 行级：异步生成器第一次被消费才执行函数体——"开工记账/失败注入"都发生在这一行之后
+        return await anext(stream)
+    except StopAsyncIteration:
+        # 行级：一块都没有就走完了——归"答不上"族，死因直说"一言不发"
+        raise UpstreamError(f"上游 {upstream} 流在首块前结束，未产出任何 chunk") from None
+    except TimeoutError as exc:
+        # 行级：归"上游答不上"族（与拒答同族）——不是"没按时说话"（超时族）
+        raise UpstreamError(f"上游 {upstream} 取块时抛出 TimeoutError: {exc}") from exc
 
 
 @dataclass
@@ -185,12 +212,79 @@ class FallbackChain:
         return attempt
 
     async def chat_stream(self, request: ChatRequest) -> AsyncIterator[ChatCompletionChunk]:
-        """流式 fallback 是 issue 03 的票面——这里响亮报错，不装死直通第一棒。
+        """流式对话：换路只发生在首块之前，首块一到手就永远单流走到底（issue 03）。
 
-        为什么不直通第一棒凑合：静默降级会让"配了双上游，流式怎么不换路"变成悬案
-        （与装配处"配错喊响"同一纪律）；门面形状先做齐（协议三件套），行为长在 03。
+        为什么换路只活在 _acquire_stream 里（换路窗口由**代码结构**保证）：它 return
+        = 首块到手 = 窗口关死；本函数剩下的只有一条透传回路，回路里没有第二个上游
+        可引用——"首块后绝不换路"不是注释约定，是"想换也没有代码可走"。双半截缝合
+        （A 的半截 + B 的半截拼成两段回答）因此在结构上不可能。
+        首块后的失败怎么处置（W2 错误契约原样成立）：异常沿透传回路穿出本生成器，
+        streaming/sse 的收尾分支只截断、不伪造 [DONE]、死因进日志——链不吞、不翻译、
+        不补帧，"半截/完整可辨"的客户端承诺一字不动。
+        给初学者的解释（透传回路在 routing/ 首现，async 生成器本体见 providers/base.py）：
+        `async for chunk in stream` 是"上游吐一块、我转一块"的搬运工循环——与
+        streaming/sse 里消费本生成器的是同一形态，链条上每一环都这么接。
         """
-        raise NotImplementedError(
-            "fallback 链的流式 fallback 尚未实现（issue 03）；非流式 chat() 已可用"
-        )
-        yield  # pragma: no cover —— 凑 async 生成器形状（同 test_streaming 桩写法）
+        # 行级：换路全在这一步——返回即"首块到手、流已承诺给唯一一个上游"
+        stream, first = await self._acquire_stream(request)
+        try:
+            yield first  # 行级：首块先交出去（与 sse_response"取到手才建响应"同一节奏）
+            async for chunk in stream:  # 行级：单流透传——这段代码里没有第二个上游
+                yield chunk
+        finally:
+            # 行级：收尾纪律（W2 显式收尾穿链到这里）——正常耗尽是空操作；弃流/截断时
+            # 立刻关掉上游生成器，fake 的收尾账因此照常记"被取消"，不等 GC 时机
+            await stream.aclose()
+
+    # 拆不动说明（_acquire_stream 整块超 40 行，含 docstring/注释；同 chat 的先例）：
+    # 尝试回路 + 两种收场判定（失败换棒/首块关窗）+ 取消传播讲解是**同一条**换路处理链
+    # 的走读现场——拆出"单次尝试"子函数会把"什么算换路信号"的判定拆到两处对照着读。
+    # 与 chat 的记账骨架同形是**刻意**的词汇复用（两腿同族，同 fake 两腿收尾账的先例），
+    # 抽共享簿记会把它变成回调迷宫，得不偿失；教学注释是规范硬要求删不得，
+    # 余量超限以本说明豁免。
+    async def _acquire_stream(
+        self, request: ChatRequest
+    ) -> tuple[AsyncIterator[ChatCompletionChunk], ChatCompletionChunk]:
+        """流式换路窗口的本体：逐棒取首块，谁先交出首块谁接管——交出即 return 关窗。
+
+        为什么"首块到手"是关窗点：那是 W2"可报错窗口"的边界——首块前失败还能用
+        状态码说话（502/504）、还能换路；首块后 200 已在路上，再换路就是把两个半截
+        缝成两段回答（checklist 的反例现场）。为什么用 return 关窗不用标志位：函数
+        返回后循环自然消亡——窗口关闭是控制流的事实，不是要人记得检查的布尔。
+        attempts 口径：记的是**窗口竞争**的结果（谁在首块前死了、谁拿到了首块）；
+        首块后的截断不回改这里——那是流的收尾账（fake.stream_endings）与日志的活，
+        两本账各说一事，billing 按已送达结算（issue 07）不需要这里撒谎。
+        """
+        # 行级：取号——HTTP 路径上中间件已发号（ContextVar 里），直调链时这里补发一个；
+        # 一轮尝试共用一号，流式 attempts 与响应头/将来账本对得上（checklist 5）
+        request_id = current_request_id() or new_request_id()
+        # 行级：本轮尝试的流水——全链失败时摘要只报本轮，不掺账本里的历史请求
+        round_attempts: list[Attempt] = []
+        last_error: Exception | None = None
+        for provider in self._providers:  # 行级：顺序即优先级——A 先试，A 挂才轮到 B
+            started = time.monotonic()
+            # 行级：异步生成器懒执行——到这里还什么都没发生，首块在下一行才真的去取
+            stream = provider.chat_stream(request)
+            try:
+                # 行级：首块前可现形的失败（拒答/空流/自带超时）都在这一行现形——
+                # 取到手才算这一棒接管成立；挂起不现形，归 issue 04 的预算票面
+                first = await _fetch_first(stream, provider.name)
+            except UpstreamError as exc:
+                # 行级：拒答/空流/上游自带超时（都已翻成 UpstreamError）——显式收尾
+                # 放弃的尝试（不悬垂），记账后换下一棒，客户端此时还一无所知
+                await stream.aclose()
+                round_attempts.append(
+                    self._record(request_id, provider.name, started, "failed", exc)
+                )
+                last_error = exc
+                continue
+            except BaseException:
+                # 行级：取消等非失败异常（断连/外层预算）响亮穿出，但收尾纪律不变——
+                # 生成器通常已终止，这里的 aclose 多是空操作，兜"还活着"的漏网形态
+                await stream.aclose()
+                raise
+            # 行级：首块到手=接管成立——记 ok、return 关窗；此行之后本函数再无"下一棒"
+            round_attempts.append(self._record(request_id, provider.name, started, "ok", None))
+            return stream, first
+        # 行级：走到这=全链失败；下一行永远抛（函数名即语义），形状说话见它自己的 docstring
+        _raise_chain_failed(last_error, round_attempts)
