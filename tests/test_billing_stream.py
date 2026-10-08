@@ -27,8 +27,10 @@ from billing.settlement import BillingProvider
 from providers.dashscope import DashScopeProvider
 from providers.fake import FakeProvider
 from routing.chain import FallbackChain
+from tests.conftest import auth_headers
 
-client = TestClient(app)
+# 默认头带套件级 TEST_KEY（W4 认证落地后的机械件）：本文件行为断言一字不改
+client = TestClient(app, headers=auth_headers())
 
 
 def _payload() -> dict:

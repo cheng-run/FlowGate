@@ -42,6 +42,11 @@ import app.main as gateway  # noqa: E402
 import streaming.sse as streaming_sse  # noqa: E402
 from providers.fake import FakeProvider  # noqa: E402
 
+# W4 认证落地后的机械件：注册一把 demo 真 key（hash 入库，走生产同一条 create 路），
+# 三幕请求全带它的凭据串敲门——fail-closed 后无头 401，demo 也不能例外。
+# 全片共 18 发（1+16+1）≤ 桶容量 20 且幕间有回填：限流不是本 demo 的剧情，够用即可。
+DEMO_KEY = gateway.keystore.create(name="demo-w2", scope="*")
+
 # 行级：uvicorn/ASGI 内部日志全静音——演示输出要干净可念；断连/截断的证据在
 # fake 账本与 streaming.sse 截断日志（act3 有专用捕获），不靠 uvicorn 的报错堆栈
 for _name in ("uvicorn", "uvicorn.error", "uvicorn.access", "uvicorn.lifespan"):
@@ -113,6 +118,8 @@ class _WireClient:
             b"POST /v1/chat/completions HTTP/1.0\r\n"
             b"Host: 127.0.0.1\r\n"
             b"Content-Type: application/json\r\n"
+            # 行级：认证头（W4 机械件）——fail-closed 后无头 401，裸 HTTP 请求也得敲门
+            + f"Authorization: Bearer {DEMO_KEY['credential']}\r\n".encode()
             + f"Content-Length: {len(body)}\r\n".encode()
             + b"\r\n"
             + body
@@ -406,6 +413,9 @@ async def _amain() -> int:
     print("=" * 60)
     print("FlowGate W2 可复跑 demo：SSE 流式三幕（fake 上游、零外网、真 socket）")
     print(f"[准备] uvicorn 监听 127.0.0.1:{port}（OS 分配端口），上游 = FakeProvider（带闸门账本）")
+    print(
+        f"[准备] 认证 fail-closed：demo key 已注册（key_id={DEMO_KEY['key_id']}），三幕请求带头敲门"
+    )
     print("=" * 60)
     try:
         for name, run in [("第一幕", act1), ("第二幕", act2), ("第三幕", act3)]:

@@ -17,8 +17,10 @@ from app.main import app
 from app.schemas import ChatCompletionChunk, ChatMessage, ChatRequest, DeltaMessage, StreamChoice
 from providers.base import Provider, UpstreamError
 from providers.fake import FakeProvider
+from tests.conftest import TEST_KEY, auth_headers
 
-client = TestClient(app)
+# 默认头带套件级 TEST_KEY（W4 认证落地后的机械件）：本文件行为断言一字不改
+client = TestClient(app, headers=auth_headers())
 
 
 def _make_request() -> ChatRequest:
@@ -281,7 +283,12 @@ def _asgi_scope() -> dict:
         "root_path": "",
         "scheme": "http",
         "query_string": b"",
-        "headers": [(b"content-type", b"application/json")],
+        # 认证头也在 scope 里（W4 认证落地后的机械件）：fail-closed 后无头 401，
+        # 手驱 ASGI 与 TestClient 同一把套件级 TEST_KEY，断连语义仍是生产语义
+        "headers": [
+            (b"content-type", b"application/json"),
+            (b"authorization", f"Bearer {TEST_KEY}".encode()),
+        ],
         "client": ("127.0.0.1", 50000),  # 随便一个地址：路由不看它，凑齐 scope 形状即可
         "server": ("127.0.0.1", 8000),
     }

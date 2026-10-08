@@ -85,13 +85,14 @@ def _payload(content: str, *, stream: bool = False) -> dict:
     return body
 
 
-def _auth(key: str) -> dict:
-    """bearer 头——限流/计费的身份口径（ADR-0007：key=Authorization bearer 串）。
+def _auth(credential: str) -> dict:
+    """Bearer 头——敲网关门的凭据串；对账身份是认证后改写的 key_id（W4 口径）。
 
-    为什么每幕各用一个 key：桶是 per key 的（不同 key 互不影响），各幕自带身份
-    就互不抢令牌——第二幕把桶压干也不会波及第一/三幕的节奏。
+    为什么每幕各铸一把真注册 key：桶是 per key_id 的（不同 key 互不影响），各幕
+    自带身份就互不抢令牌——第二幕把桶压干也不会波及第一/三幕的节奏；凭据串是
+    敲门砖（验过即弃），限流/账本看到的都是 key_id。
     """
-    return {"Authorization": f"Bearer {key}"}
+    return {"Authorization": f"Bearer {credential}"}
 
 
 async def _start_server() -> tuple[uvicorn.Server, asyncio.Task, int]:
@@ -120,6 +121,8 @@ async def _start_server() -> tuple[uvicorn.Server, asyncio.Task, int]:
 
 async def act1(port: int) -> None:
     """第一幕：fake-a 拒答、fake-b 接管——账本恰 1 笔用户账（降级不重复扣费）。"""
+    # 行级：本幕的真注册 key（W4 机械件）——fail-closed 后无头 401，每幕自带身份
+    key_a = gateway.keystore.create(name="demo-w3-a", scope="*")
     # 行级：每幕独立内存账本——数字互不污染、演示零残留（缺省装配同款 ":memory:"）
     ledger = BillingLedger(":memory:")
     fake_a = FakeProvider(name="fake-a", failure="fail")
@@ -134,7 +137,7 @@ async def act1(port: int) -> None:
         response = await client.post(
             "/v1/chat/completions",
             json=_payload("降级不重复扣费"),
-            headers=_auth("demo-key-a"),
+            headers=_auth(key_a["credential"]),
         )
     body = response.json()
     content = body["choices"][0]["message"]["content"]
@@ -152,7 +155,9 @@ async def act1(port: int) -> None:
     trace = " → ".join(f"{a.upstream} {a.outcome}" for a in chain.attempts)
     print(f"fake-a 恒失败注入 → FallbackChain 自动换路 fake-b 作答，attempts 流水：{trace}")
     print(
-        f"用户账恰 {len(charges)} 笔（key=demo-key-a，total={charges[0].total_tokens} tokens），"
+        # 口径：报账本里真实的身份 = key_id（W4 身份改写后落账的就是它），不是旧时的 bearer 串
+        f"用户账恰 {len(charges)} 笔（key_id={charges[0].key}，"
+        f"total={charges[0].total_tokens} tokens），"
         f"内部损耗账恰 {len(losses)} 条（{losses[0].upstream} 的失败尝试，不收钱）"
     )
     print("✓ 第一幕通过——「降级不重复扣费」式子：N 逻辑请求含 M 次失败尝试 → 用户账恰 N 笔")
@@ -170,6 +175,8 @@ async def act2(port: int) -> None:
     # tests/test_ratelimit.py 并发用例同一确定性口径（它也冻结时钟，零真实 sleep）
     old_clock = bucket_module.clock
     bucket_module.clock = lambda: 0.0
+    # 行级：本幕的真注册 key（W4 机械件）——8 路共用它，压的就是"同 key 同一只桶"
+    key_b = gateway.keystore.create(name="demo-w3-b", scope="*")
     try:
         # 行级：把限流口径换成测试同款（容量 3、速率 1/s）——同 monkeypatch 装配绑定的
         # 手法，生产不加钩子；缺省 20/10 要压出 429 得发 21 发，演示数字反而不如 8 选 3 直白
@@ -187,7 +194,7 @@ async def act2(port: int) -> None:
                     client.post(
                         "/v1/chat/completions",
                         json=_payload("限流硬保证"),
-                        headers=_auth("demo-key-b"),
+                        headers=_auth(key_b["credential"]),
                     )
                     for _ in range(CONCURRENT_CLIENTS)
                 )
@@ -202,7 +209,8 @@ async def act2(port: int) -> None:
     _check(len(fake.calls) == RATE_CAPACITY, f"上游该只见 {RATE_CAPACITY} 次调用：{fake.calls}")
     rejected = next(r for r in responses if r.status_code == 429)  # 行级：取一发 429 读文案
     print(
-        f"{CONCURRENT_CLIENTS} 路并发同 key（Bearer demo-key-b）同时打网关……"
+        # 口径：叙述里报 key_id（公开身份）——凭据串只在签发那一刻出现一次，不再回显
+        f"{CONCURRENT_CLIENTS} 路并发同 key（key_id={key_b['key_id']}）同时打网关……"
         f"状态码逐位对账：200 恰 {statuses.count(200)} 个、429 恰 {statuses.count(429)} 个"
     )
     print(
@@ -216,6 +224,8 @@ async def act2(port: int) -> None:
 # 二次结算幂等是同一条"流怎么收尾、账怎么结"故事的走读现场，故保持单函数（同 act1）。
 async def act3(port: int) -> None:
     """第三幕：流末回填结算恰 1 笔 + usage 帧恰一帧在 [DONE] 前 + 二次结算幂等去重。"""
+    # 行级：本幕的真注册 key（W4 机械件）——结算对账身份是它的 key_id（见下方二次结算）
+    key_c = gateway.keystore.create(name="demo-w3-c", scope="*")
     ledger = BillingLedger(":memory:")
     fake = FakeProvider()
     gateway.provider = BillingProvider(fake, ledger=ledger)
@@ -229,7 +239,7 @@ async def act3(port: int) -> None:
             "POST",
             "/v1/chat/completions",
             json=_payload(prompt, stream=True),
-            headers=_auth("demo-key-c"),
+            headers=_auth(key_c["credential"]),
         ) as response:
             _check(response.status_code == 200, f"流式请求该 200，实得 {response.status_code}")
             request_id = response.headers["x-request-id"]  # 行级：幂等键从响应头取（对账口）
@@ -257,7 +267,7 @@ async def act3(port: int) -> None:
     # 二次结算（来者不善：携另一组 usage 数字）——幂等 no-op，账本仍恰一笔（账本为准）
     again = ledger.settle(
         request_id,
-        "demo-key-c",
+        key_c["key_id"],  # 行级：对账身份=key_id（W4 口径）——与首次结算同一身份
         prompt_text=prompt,
         completion_text=f"fake-reply: {prompt}",
         official_usage=Usage(prompt_tokens=1, completion_tokens=1, total_tokens=2),
@@ -349,6 +359,7 @@ async def _amain() -> int:
         f"[准备] uvicorn 监听 127.0.0.1:{port}（OS 分配端口），"
         "三幕上游 = FakeProvider（可控失败形态）"
     )
+    print("[准备] 认证 fail-closed：每幕各铸一把真注册 key（叙述只报 key_id，凭据串不回显）")
     print("=" * 60)
     live_ran = False  # 行级：live 幕跑没跑的账——横幅据此交代（跳过是常态，不算失败）
     try:

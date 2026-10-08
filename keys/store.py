@@ -25,6 +25,23 @@ _CREDENTIAL_PREFIX = "fgk_"
 _KEY_ID_PREFIX = "key_"
 
 
+class AuthenticationError(Exception):
+    """认证失败的统一信号：401 的唯一失败形状（app/ 异常处理器翻状态码）。
+
+    为什么消息钉死在构造里、不收形参：五种失败形态（无头/空串/坏串/未注册/已
+    撤销）必须回**同一条** 401 文案（防枚举，story 3）——允许调用方传消息就是给
+    文案分叉留缝；构造上禁止分叉，枚举攻击连"错得不一样"都读不到。凭据串也
+    永不进消息（不回显凭据）。
+    为什么不放 app/：与 RateLimitError/BudgetExceededError 同一纪律——失败形状
+    住在语义所属的深模块（"查无=统一失败"是 keys 的地基，见 verify），HTTP 状态
+    码翻译集中在 app/ 的异常处理器。
+    """
+
+    def __init__(self) -> None:
+        """统一文案即唯一文案——无参可传，防枚举由构造保证（见类 docstring）。"""
+        super().__init__("认证失败：虚拟 key 缺失或无效")
+
+
 def _now() -> str:
     """UTC ISO-8601 时间戳（created_at / revoked_at 共用）。
 

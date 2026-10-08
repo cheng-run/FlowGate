@@ -14,6 +14,7 @@ import os
 
 from billing.ledger import BillingLedger
 from billing.settlement import BillingProvider
+from keys.store import KeyStore
 from providers.base import Provider
 from providers.dashscope import DEFAULT_BASE_URL, DashScopeProvider
 from providers.fake import FakeProvider
@@ -127,6 +128,20 @@ def create_ledger() -> BillingLedger:
     return BillingLedger(db_path)
 
 
+def create_keystore() -> KeyStore:
+    """装配处：按环境变量装虚拟 key 库（env 口径与账本**同一个** FLOWGATE_BILLING_DB）。
+
+    为什么和账本共用 env：spec 的"一个 SQLite 文件"完工承诺——key 表与账本表落
+    同一个文件、各管各表（CREATE TABLE IF NOT EXISTS 自治建表，keys/store.py 同款
+    纪律），部署只用管一个库路径。
+    为什么缺省也是 ":memory:"：与 create_ledger 同款分层缺省——测试/演示零残留；
+    注意 :memory: 下两个连接是两座互不相见的临时库（key 表与账本表各活各的），
+    测试要的正是这个隔离（conftest 种子只进 key 库），落盘时才合成同一个文件。
+    """
+    db_path = os.environ.get("FLOWGATE_BILLING_DB", ":memory:")
+    return KeyStore(db_path)
+
+
 def create_budget() -> int:
     """装配处：按环境变量装每 key 的 token 预算（FLOWGATE_BUDGET_TOKENS）。
 
@@ -144,6 +159,8 @@ def create_budget() -> int:
 # ===== 装配处（composition root）=====
 # 全代码库唯一允许点名具体适配器类的地方（ADR-0001）：核心路由只见 Provider 协议，
 # 换上游=改环境变量 FLOWGATE_PROVIDER，业务代码一行不动。
+# 虚拟 key 库先落座：认证门卫每请求查它（撤销即时生效的前提）；与账本同库文件
+keystore: KeyStore = create_keystore()
 # 账本单例先落座：结算门面与门卫的预算检查共用同一本账（用户账求和=花销唯一出处）
 ledger: BillingLedger = create_ledger()
 # 每 key 的 token 预算（0=不设限）：门卫进门先查它，超预算在上游调用前就 429

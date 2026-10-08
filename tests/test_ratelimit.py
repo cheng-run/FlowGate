@@ -16,8 +16,10 @@ from fastapi.testclient import TestClient
 from app.main import app
 from providers.fake import FakeProvider
 from ratelimit.bucket import RateLimiter
+from tests.conftest import auth_headers, mint_key
 
-client = TestClient(app)
+# 默认头带套件级 TEST_KEY（W4 认证落地后的机械件）：同 key 用例直接用默认身份
+client = TestClient(app, headers=auth_headers())
 
 
 def _payload(stream: bool | None = None) -> dict:
@@ -29,11 +31,6 @@ def _payload(stream: bool | None = None) -> dict:
     if stream is not None:
         body["stream"] = stream  # 行级：显式控制流式开关——None 时字段不进请求体
     return body
-
-
-def _auth_headers(key: str) -> dict:
-    """带 bearer 串的请求头——限流的 key 就是这个不透明身份串。"""
-    return {"Authorization": f"Bearer {key}"}
 
 
 class _FakeClock:
@@ -67,10 +64,8 @@ def test_rate_limit_rejects_before_upstream_when_bucket_empty(
     fake = FakeProvider()  # 行级：记账 fake——被拒请求"零上游调用"的可断言面
     monkeypatch.setattr("app.main.provider", fake)
 
-    first = client.post("/v1/chat/completions", json=_payload(), headers=_auth_headers("sk-test-1"))
-    second = client.post(
-        "/v1/chat/completions", json=_payload(), headers=_auth_headers("sk-test-1")
-    )
+    first = client.post("/v1/chat/completions", json=_payload())
+    second = client.post("/v1/chat/completions", json=_payload())
 
     assert first.status_code == 200
     assert second.status_code == 429
@@ -94,16 +89,8 @@ def test_rate_limit_rejects_stream_before_upstream_when_bucket_empty(
     fake = FakeProvider()
     monkeypatch.setattr("app.main.provider", fake)
 
-    first = client.post(
-        "/v1/chat/completions",
-        json=_payload(stream=True),
-        headers=_auth_headers("sk-test-1"),
-    )
-    second = client.post(
-        "/v1/chat/completions",
-        json=_payload(stream=True),
-        headers=_auth_headers("sk-test-1"),
-    )
+    first = client.post("/v1/chat/completions", json=_payload(stream=True))
+    second = client.post("/v1/chat/completions", json=_payload(stream=True))
 
     assert first.status_code == 200
     assert second.status_code == 429
@@ -132,12 +119,13 @@ async def test_concurrent_requests_pass_exactly_capacity(
         transport=httpx.ASGITransport(app=app), base_url="http://test"
     ) as async_client:
         # 复杂语句（推导式+gather）行上：8 路同时打同一 key——调度交错是真实的
+        # （AsyncClient 没有 client 默认头，显式带套件级凭据）
         responses = await asyncio.gather(
             *[
                 async_client.post(
                     "/v1/chat/completions",
                     json=_payload(),
-                    headers=_auth_headers("sk-concurrent"),
+                    headers=auth_headers(),
                 )
                 for _ in range(8)
             ]
@@ -165,12 +153,8 @@ def test_burst_up_to_capacity_then_refill_at_rate(
 
     def fire(n: int) -> list[int]:
         """连发 n 发同 key 请求，返回状态码列表——三段推进共用的"打一梭子"手法。"""
-        return [
-            client.post(
-                "/v1/chat/completions", json=_payload(), headers=_auth_headers("sk-burst")
-            ).status_code
-            for _ in range(n)
-        ]
+        # 复杂语句（推导式）行上：默认头=套件级身份，连发 n 发共享同一只桶
+        return [client.post("/v1/chat/completions", json=_payload()).status_code for _ in range(n)]
 
     # ① 突发段：桶出生即满（3 枚）——第 4 发见空桶
     assert fire(4) == [200, 200, 200, 429]
@@ -187,35 +171,46 @@ def test_keys_have_independent_buckets(monkeypatch: pytest.MonkeyPatch) -> None:
 
     怎么证明：容量 1 的限流器 + 冻结时钟，key-a 连发两发打空桶后，key-b 再发一发
     ——断言 a 的第二发 429、b 的那一发 200。反例（全局一只桶）下 b 也会 429，
-    隔离性即结构：每 key 一只桶（dict 分键），互不为邻。
+    隔离性即结构：每 key 一只桶（dict 分键），互不为邻。桶的分键是 key_id——
+    两把独立注册 key（不同凭据串 → 不同 key_id）就是对照组。
     """
     monkeypatch.setattr("ratelimit.bucket.clock", _FakeClock())
     monkeypatch.setattr("app.main.limiter", RateLimiter(capacity=1, per_second=1.0))
     monkeypatch.setattr("app.main.provider", FakeProvider())
+    # 两把独立 key：认证后身份=key_id，隔离组必须是两个真实注册身份
+    credential_a = mint_key(name="ratelimit-a")["credential"]
+    credential_b = mint_key(name="ratelimit-b")["credential"]
 
-    def fire(key: str) -> int:
-        """以指定 key 发一发，返回状态码——同款请求只换身份串。"""
+    def fire(credential: str) -> int:
+        """以指定凭据串发一发，返回状态码——同款请求只换敲门砖。"""
         return client.post(
-            "/v1/chat/completions", json=_payload(), headers=_auth_headers(key)
+            "/v1/chat/completions", json=_payload(), headers=auth_headers(credential)
         ).status_code
 
-    assert fire("sk-key-a") == 200
-    assert fire("sk-key-a") == 429  # 行级：key-a 的桶已空
-    assert fire("sk-key-b") == 200  # 行级：key-b 有自己的桶——a 的空桶碍不着它
+    assert fire(credential_a) == 200
+    assert fire(credential_a) == 429  # 行级：key-a 的桶已空
+    assert fire(credential_b) == 200  # 行级：key-b 有自己的桶——a 的空桶碍不着它
 
 
-def test_anonymous_request_bypasses_rate_limit(monkeypatch: pytest.MonkeyPatch) -> None:
-    """证明：无 Authorization 的请求放行不占桶——匿名口径的 pin（2026-10-07 用户拍板）。
+def test_anonymous_request_gets_401_without_touching_bucket(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """证明：匿名请求 401 且不占桶——fail-closed 取代了 W3 的"匿名放行不占桶"。
 
-    怎么证明：容量 1 的限流器 + 冻结时钟（无回填），连发三发**不带头**的请求——
-    断言全部 200。这条 pin 让"匿名放行"从口头口径变成可执行事实：将来谁改了口径，
-    本测试立刻红；W4 认证插进门卫之前后它应改写成"匿名 401"，改写点就在这。
+    W3 时代本测试钉"匿名放行不占桶"（2026-10-07 用户拍板旧口径），并预告
+    "W4 认证插进门卫之前后应改写成匿名 401，改写点就在这"——本测试就是那场改写：
+    三发匿名全部 401，且**一令牌都没占**（容量 1 的桶还满着，带凭据的第一发仍 200）。
+    证明手法：裸 client（无默认头）发匿名三发，再用带凭据 client 发第四发——
+    若 401 发生在占桶之前，桶必然毫发无损；反例（先占桶再拒）第四发就会 429。
     """
     monkeypatch.setattr("ratelimit.bucket.clock", _FakeClock())
     monkeypatch.setattr("app.main.limiter", RateLimiter(capacity=1, per_second=1.0))
     monkeypatch.setattr("app.main.provider", FakeProvider())
 
-    # 三发匿名（无 Authorization 头）——若匿名占桶，第二发起就该 429
-    statuses = [client.post("/v1/chat/completions", json=_payload()).status_code for _ in range(3)]
+    # 三发匿名（裸 client，请求里没有 Authorization）——fail-closed 全数 401
+    bare = TestClient(app)
+    statuses = [bare.post("/v1/chat/completions", json=_payload()).status_code for _ in range(3)]
 
-    assert statuses == [200, 200, 200]
+    assert statuses == [401, 401, 401]
+    # 带凭据的一发仍 200：匿名三发没占桶（容量 1 的令牌还在）——401 先于占桶
+    assert client.post("/v1/chat/completions", json=_payload()).status_code == 200

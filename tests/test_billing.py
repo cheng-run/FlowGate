@@ -19,8 +19,10 @@ from billing.settlement import BillingProvider
 from providers.dashscope import DashScopeProvider
 from providers.fake import FakeProvider
 from routing.chain import FallbackChain
+from tests.conftest import auth_headers, mint_key
 
-client = TestClient(app)
+# 默认头带套件级 TEST_KEY（W4 认证落地后的机械件）：本文件行为断言一字不改
+client = TestClient(app, headers=auth_headers())
 
 
 def _payload() -> dict:
@@ -117,18 +119,21 @@ def test_n_requests_with_m_failed_attempts_bill_exactly_n_charges(
 def test_over_budget_key_gets_429_before_any_upstream_call(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """证明：超预算 key 在上游调用前 429——花销按 key 对用户账求和（checklist 6）。
+    """证明：超预算 key 在上游调用前 429——花销按 key_id 对用户账求和（checklist 6）。
 
     怎么证明：预算设 5 tokens（一发请求的估算花销≈7 就能顶穿），第一发正常结算后
     同 key 第二发 429 且 detail 点名预算、上游零调用（fake.calls 只有第一发）；
-    换个 key 照常 200——预算按 key 隔离。反例是先生成后拒：钱已经花出去了，
-    预算就成了事后统计而不是治理。
+    换个 key 照常 200——预算按 key_id 隔离（W4 身份口径：认证后 key_var 存 key_id）。
+    反例是先生成后拒：钱已经花出去了，预算就成了事后统计而不是治理。
     """
     ledger = _use_ledger(monkeypatch, tmp_path)
     fake = FakeProvider()  # 行级：记账 fake——被拒那发"零上游调用"的可断言面
     monkeypatch.setattr("app.main.provider", BillingProvider(fake, ledger=ledger))
     monkeypatch.setattr("app.main.budget", 5)
-    over_budget = {"Authorization": "Bearer sk-budget"}
+    # 两把独立注册 key（W4 认证后裸凭据串不再是身份）：预算隔离的对照组 = 两个 key_id
+    budget_key = mint_key(name="billing-budget")["credential"]
+    other_key = mint_key(name="billing-other")["credential"]
+    over_budget = auth_headers(budget_key)
 
     first = client.post("/v1/chat/completions", json=_payload(), headers=over_budget)
     second = client.post("/v1/chat/completions", json=_payload(), headers=over_budget)
@@ -141,9 +146,9 @@ def test_over_budget_key_gets_429_before_any_upstream_call(
     other = client.post(
         "/v1/chat/completions",
         json=_payload(),
-        headers={"Authorization": "Bearer sk-other"},
+        headers=auth_headers(other_key),
     )
-    assert other.status_code == 200  # 行级：别的 key 不受影响——预算按 key 求和的隔离面
+    assert other.status_code == 200  # 行级：别的 key 不受影响——预算按 key_id 求和的隔离面
 
 
 def test_nonstream_usage_carries_official_numbers_to_response_and_books(

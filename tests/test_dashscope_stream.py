@@ -19,8 +19,11 @@ from app.main import app
 from app.schemas import ChatCompletionChunk, ChatMessage, ChatRequest
 from providers.base import TransientUpstreamError, UpstreamError
 from providers.dashscope import DashScopeProvider
+from tests.conftest import auth_headers
 
-client = TestClient(app)
+# 默认头带套件级凭据（W4 认证落地后的机械件）——注意与本文件下游的 TEST_KEY
+# （上游假 key，进 mock 断言）无关：那是第二跳的头，这是敲网关门的头
+client = TestClient(app, headers=auth_headers())
 
 # 测试专用的假 key / 假地址：只进 mock 断言，永不触网（与 test_dashscope 同款）
 TEST_KEY = "sk-test-key"

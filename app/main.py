@@ -12,17 +12,18 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from app.schemas import ChatCompletionResponse, ChatRequest
 
-# 装配处（根级 assembly）的四个单例转绑到本模块命名空间：既有测试/演示
-# monkeypatch app.main.provider / limiter / ledger / budget 的手法一个不破
+# 装配处（根级 assembly）的五个单例转绑到本模块命名空间：既有测试/演示
+# monkeypatch app.main.provider / limiter / ledger / budget / keystore 的手法一个不破
 # （票 05 验收项：名字仍绑在 app.main，门卫与路由读到的是同一绑定）。
 # create_provider 一并转出：tests/test_kimi_live.py（live 真网 smoke）以
 # app.main 为装配入口直取生产链，该文件不在本票改动面——别名留着它才不破。
 # 下一行 `as X` 自别名是显式 re-export 形态：本模块不消费这个函数，写成
 # 自别名 ruff F401 才不把它当 unused-import 删掉（不是笔误，是给它的豁免）。
-from assembly import budget, ledger, limiter, provider
+from assembly import budget, keystore, ledger, limiter, provider
 from assembly import create_provider as create_provider
 from billing.identity import current_key, key_var
 from billing.ledger import BudgetExceededError
+from keys.store import AuthenticationError
 from providers.base import UpstreamError
 from ratelimit.bucket import RateLimitError
 from routing.chain import AttemptTimeoutError
@@ -47,9 +48,11 @@ class RequestContextMiddleware:
     为加个响应头去动流的搬运路径得不偿失。
     为什么发号在进门：号要先于路由存在——限流/预算门卫（进路由之前的一步）与
     billing 结算都按它对账；fallback 链的 attempts 直接取用，同一请求永不二号。
-    为什么 key 也在这里进背包（issue 06）：key 在进门才可见，结算却在收尾——
+    为什么凭据也在这里进背包（issue 06）：凭据在进门才可见，结算却在收尾——
     set/reset 必须罩住**整个**请求（含流式响应的发送）才不串门，能罩全的只有
-    中间件这一层；门卫与结算从背包取，不各自再解析一遍 Authorization。
+    中间件这一层；认证门卫与结算从背包取，不各自再解析一遍 Authorization。
+    进门放的是凭据串、认证门卫改写成 key_id（W4 身份口径）：本层只管提取与收尾，
+    校验与改写归 auth_gate——出门按进门时的还原点回滚背包，中间怎么改写都不用它操心。
     """
 
     def __init__(self, app) -> None:
@@ -154,6 +157,19 @@ async def budget_exceeded_handler(request: Request, exc: BudgetExceededError) ->
     return JSONResponse(status_code=429, content={"detail": str(exc)})
 
 
+@app.exception_handler(AuthenticationError)
+async def authentication_error_handler(request: Request, exc: AuthenticationError) -> JSONResponse:
+    """认证失败 → 401：同一条文案（防枚举），响应体形状与 429/502/504 同款 {"detail"}。
+
+    为什么翻译集中在这（同 502/504/429 纪律）：路由保持传送带，失败翻译只在
+    handler 这几行；401/403/429 三分（没身份/无权限/太快或超预算），客户端按
+    状态码就知道下一步该做什么（带对凭据 / 换 model / 退避提额）。
+    为什么 str(exc) 就够、handler 不补信息：AuthenticationError 构造上不收消息
+    （keys/store.py：防枚举）——想"顺手丰富一下错误详情"都没有缝。
+    """
+    return JSONResponse(status_code=401, content={"detail": str(exc)})
+
+
 @app.get("/health")
 def health() -> dict[str, str]:
     """健康检查：给探活/监控用的最小契约（200 + status=ok）。
@@ -178,12 +194,13 @@ def _scope_header(scope: dict, name: str) -> str | None:
 
 
 def _bearer_key(authorization: str | None) -> str | None:
-    """从 Authorization 头取 bearer 串当限流 key；无头/空值 = 匿名（返回 None）。
+    """从 Authorization 头取 bearer 凭据串；无头/空值 = 匿名（返回 None）。
 
-    不透明身份（checklist 3）：不校验格式、不查库、不撤销——凭据的生成/校验/撤销
-    是 W4 keys/ 的事，这里只把串当身份用。"Bearer " 前缀剥掉（大小写不敏感）：
-    key 是凭据串本身；非 Bearer 形态（如 Basic xxx）整段值当不透明 key——宁可把它
-    当陌生 key 限流，也不给"换个鉴权 scheme 就绕过限流"留后门。
+    只提取不校验：校验/撤销是认证门卫（auth_gate → keys/）的事，这里管的是
+    "头 → 凭据串"的形状（单一提取处，issue 06）。"Bearer " 前缀剥掉（大小写不
+    敏感）：凭据串是 fgk_ 本体；非 Bearer 形态（如 Basic xxx）整段值当凭据串交上去
+    ——hash 查无不区分形态，同样一条 401（防枚举），不给"换个 Authorization
+    scheme 就绕过认证"留后门。
     """
     if authorization is None:
         return None
@@ -192,33 +209,69 @@ def _bearer_key(authorization: str | None) -> str | None:
         return None
     scheme, _, rest = value.partition(" ")  # 行级：拆"scheme 与凭据串"——只认打头的 Bearer
     if scheme.lower() == "bearer":
-        key = rest.strip()
-        return key or None  # 行级："Bearer" 后面空空如也=没带凭据，按匿名放行
+        credential = rest.strip()
+        return credential or None  # 行级："Bearer" 后面空空如也=没带凭据，按匿名算
     return value
 
 
-async def rate_limit_gate() -> None:
-    """门卫（FastAPI 依赖）：进路由之前的一步——按 key 扣令牌，空桶抛 RateLimitError。
+async def auth_gate() -> str:
+    """认证门卫（FastAPI 依赖）：/v1/* 的第一道门——fail-closed，过门返回 key_id。
+
+    给初学者的解释（依赖**链**在本代码库首现）：rate_limit_gate 的形参挂着
+    Depends(auth_gate)——FastAPI 先跑认证、再跑限流，认证抛异常请求就死在这，
+    限流门卫与路由本体根本不会执行。这就是"认证依赖接在限流门卫之前"（ADR-0007
+    预告）的落地形态，且是结构性保证（写在依赖图里，不靠参数书写顺序）。
+    为什么必须 async（比 rate_limit_gate 的理由更重）：同步依赖会被 FastAPI 丢进
+    线程池跑，线程里 ContextVar.set 改的是**拷贝**出来的上下文、改不回请求主链——
+    身份要写回背包，声明成 async 是正确性的前提，不只是省线程。
+    fail-closed：无头/空串/坏串/未注册/已撤销全部同一条 AuthenticationError——
+    verify 对不存在/已撤销回同一种"查无"（keys/store.py 的防枚举地基），文案分叉
+    在构造上就不可能（AuthenticationError 不收消息）。空库=拒绝一切：verify 查
+    任何凭据都是查无，不存在"认证未激活"状态（spec 口径）。
+    为什么凭据从背包取：中间件进门时已提取 Authorization（单一提取处，门卫与
+    结算都不各自再解析一遍头）——这里只做校验，提取形状不归门卫管。
+    身份改写（W4 口径）：过门后把背包里的凭据串换成 key_id——从此账本行、限流桶、
+    预算求和全按 key_id 对账，凭据串验过即弃、不落任何库表（story 15）。中间件
+    出门按它进门时的还原点回滚背包（ContextVar 乱序 reset 合法，2026-10-08 实测），
+    这一刀改写不用自己收尾。
+    新增 /v1 路由必须挂本门卫：现在"全 fail-closed"靠唯一业务路由的依赖链枚举成立，
+    将来谁加路由忘挂 gate 就是 fail-open——这是 06 边界检查之外的人肉防线（评审
+    前向风险记录，2026-10-08）。
+    """
+    credential = current_key()  # 行级：背包里是中间件进门放的凭据串（匿名=None）
+    key_id = keystore.verify(credential) if credential else None
+    if key_id is None:
+        raise AuthenticationError()  # 行级：五变体同一条 401（防枚举），不回显凭据
+    key_var.set(key_id)  # 行级：身份改写——背包换成公开身份，凭据串就此丢弃
+    return key_id
+
+
+async def rate_limit_gate(_auth: str = Depends(auth_gate)) -> None:
+    """门卫（FastAPI 依赖）：认证之后的一步——按 key 扣令牌，空桶抛 RateLimitError。
 
     给初学者的解释（FastAPI 依赖在本代码库首现）：Depends(rate_limit_gate) 把本函数
     "钉"在路由前面执行——它跑完返回 None，路由照常；它抛异常，请求到此为止，
     路由本体（乃至上游调用）根本不会发生。门卫与路由分离，路由保持传送带（checklist 6）。
+    为什么形参挂着 auth_gate：认证接在限流之前（ADR-0007 预告）——嵌套依赖是
+    结构性顺序（先认证后限流），_ 前缀=只接线不取值（key 仍从背包取，见下）。
     为什么声明 async（虽然体内没有 await）：同步依赖会被 FastAPI 丢进线程池跑，
     async 依赖直跑事件循环——门卫是纯内存一步（扣令牌），不值得占用线程池，
     也免了线程切换；与路由同为 async 是同一条调用约定（同 502 handler 的理由）。
     为什么拒绝在这里就够：门卫在上游调用之前（checklist 2）——429 是零成本的，
     桶里没令牌的请求连 fake/真上游的面都见不到。
-    key 口径（2026-10-07 用户拍板，见 ADR-0007）：key=Authorization bearer 串；
-    **匿名（无 Authorization）放行不占桶**——限流治理"每个身份不许打爆"，认证
-    （W4）管"有没有身份"；W4 把认证插在本门卫之前，此处的 key 接口一字不改。
-    key 的出处（issue 06）：中间件进门时已把身份放进背包——门卫不再自己解析
-    Authorization（身份口径单一出处，结算门面取的是同一个）。
+    key 口径（W4 票 02 兑现 ADR-0007 预告）：认证门卫插在本门卫之前后，匿名/坏
+    凭据在认证门就是 401，"匿名放行不占桶"的 W3 口径就此作废——到这的必有身份。
+    身份=key_id（认证门卫验出后改写背包）：账本行、限流桶、预算求和全按 key_id
+    对账，凭据串不是身份、不落任何库。ADR-0007 的"key=bearer 串"段由 09 的
+    ADR-0010 兑现更新。
+    key 的出处（issue 06）：中间件进门时已把凭据放进背包、认证门卫改写成 key_id——
+    门卫不再自己解析 Authorization（身份口径单一出处，结算门面取的是同一个）。
     预算为什么排在限流前面（issue 06）："进门先查预算"（spec 口径）——超预算是
     终局性的（再来多少次都没用），先说真话且不给注定被拒的请求消耗限流令牌。
     """
     key = current_key()
     if key is None:
-        return  # 行级：匿名放行不占桶也不查预算——口径见 docstring，用例都显式带 bearer
+        return  # 行级：防御性兜底——fail-closed 后没有 HTTP 路径能进这（认证已拒）
     # 行级：预算前置检查——花销按 key 对用户账求和，超预算在上游调用前 429（story 14）；
     # 不设限（budget=0）连求和都不查，设限时求和只跑一趟（比较与文案共用一份数字）
     if budget > 0:
