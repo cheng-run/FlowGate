@@ -61,7 +61,7 @@ def _hash_credential(credential: str) -> str:
 
 
 class KeyStore:
-    """虚拟 key 表的唯一读写面：create / verify / revoke / list。"""
+    """虚拟 key 表的唯一读写面：create / verify / scope_of / revoke / list。"""
 
     def __init__(self, db_path: str) -> None:
         """key 表落在 SQLite 单文件（":memory:"=进程内临时库，测试走 tmp_path 文件）。
@@ -89,8 +89,9 @@ class KeyStore:
     def create(self, name: str, scope: str) -> dict[str, str]:
         """签发一把新虚拟 key：生成凭据串，返回 {key_id, credential}——明文仅此一次。
 
-        name/scope 由调用方给定、原样落库：store 层不解释 scope（解释归 03 授权层），
-        name 是人读标签也就不做校验（keyctl/serve 各定各的默认值）。
+        name/scope 由调用方给定、原样落库：store 层不解释 scope（解释归
+        keys/scope.py 的 check_scope），name 是人读标签也就不做校验（keyctl/serve
+        各定各的默认值）。
         """
         # 行级：凭据串=fgk_ + 32 字节密码学随机——token_urlsafe 输出 URL 安全字符，
         # 可直接进 Authorization 头与命令行，不会撞上需要转义的符号
@@ -119,6 +120,21 @@ class KeyStore:
             "SELECT key_id FROM keys WHERE credential_hash = ? AND revoked_at IS NULL",
             (_hash_credential(credential),),
         ).fetchone()
+        return None if row is None else row[0]
+
+    def scope_of(self, key_id: str) -> str | None:
+        """按 key_id 取 scope 原文；查无返回 None——只存取不解释（解释归 keys/scope.py）。
+
+        为什么另开读口而不是复用 list：授权门卫每请求都要按 key_id 取 scope，
+        list 是全量审计视图（O(n) + 装字典），拿它查一把 key 是杀鸡用牛刀
+        （票 02 备忘给的两个选项之一：新增读口）。
+        为什么不并进 verify 一次查出：verify 的返回契约是 key_id（票 01 钉死，
+        防枚举的"查无=None"口径也在那）——拆开两问各有各的失败语义，合返回值
+        会把两种失败搅进一个形状；SQLite 本地文件库两次主键查的代价可忽略。
+        为什么不看 revoked_at：撤销的拦截点在 verify（HTTP 面=401），本方法是
+        存取口（审计/授权读原文）——存取层不解释撤销语义（与 list 含已撤销同理）。
+        """
+        row = self._db.execute("SELECT scope FROM keys WHERE key_id = ?", (key_id,)).fetchone()
         return None if row is None else row[0]
 
     def list(self) -> list[dict[str, str]]:

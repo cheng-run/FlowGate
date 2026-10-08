@@ -23,6 +23,7 @@ from assembly import budget, keystore, ledger, limiter, provider
 from assembly import create_provider as create_provider
 from billing.identity import current_key, key_var
 from billing.ledger import BudgetExceededError
+from keys.scope import AuthorizationError, check_scope
 from keys.store import AuthenticationError
 from providers.base import UpstreamError
 from ratelimit.bucket import RateLimitError
@@ -162,12 +163,26 @@ async def authentication_error_handler(request: Request, exc: AuthenticationErro
     """认证失败 → 401：同一条文案（防枚举），响应体形状与 429/502/504 同款 {"detail"}。
 
     为什么翻译集中在这（同 502/504/429 纪律）：路由保持传送带，失败翻译只在
-    handler 这几行；401/403/429 三分（没身份/无权限/太快或超预算），客户端按
+    handler 这几行；401/403/429 三分（没身份/不在 scope/太快或超预算），客户端按
     状态码就知道下一步该做什么（带对凭据 / 换 model / 退避提额）。
     为什么 str(exc) 就够、handler 不补信息：AuthenticationError 构造上不收消息
     （keys/store.py：防枚举）——想"顺手丰富一下错误详情"都没有缝。
     """
     return JSONResponse(status_code=401, content={"detail": str(exc)})
+
+
+@app.exception_handler(AuthorizationError)
+async def authorization_error_handler(request: Request, exc: AuthorizationError) -> JSONResponse:
+    """授权失败 → 403：detail 点名被拒的 model（story 9），形状同 {"detail"}（同款纪律）。
+
+    为什么翻译集中在这（同 502/504/429/401 纪律）：路由保持传送带，失败翻译只在
+    handler 这几行；401（没身份）/ 403（有身份但 model 不在 scope）/ 429（太快或
+    超预算）三分，客户端按状态码就知道下一步——带对凭据 / 换 model / 退避提额。
+    为什么 detail 可以点名 model 而 401 必须统一文案：403 的话对**已认证**调用方
+    要可操作（story 9：别让客户端猜），点名的还是他自己发来的字符串；401 的话对
+    陌生人必须含糊（防枚举）——两种"说多少"各有威胁模型，不是双重标准。
+    """
+    return JSONResponse(status_code=403, content={"detail": str(exc)})
 
 
 @app.get("/health")
@@ -234,9 +249,9 @@ async def auth_gate() -> str:
     预算求和全按 key_id 对账，凭据串验过即弃、不落任何库表（story 15）。中间件
     出门按它进门时的还原点回滚背包（ContextVar 乱序 reset 合法，2026-10-08 实测），
     这一刀改写不用自己收尾。
-    新增 /v1 路由必须挂本门卫：现在"全 fail-closed"靠唯一业务路由的依赖链枚举成立，
-    将来谁加路由忘挂 gate 就是 fail-open——这是 06 边界检查之外的人肉防线（评审
-    前向风险记录，2026-10-08）。
+    新增 /v1 路由必须挂门卫链（rate_limit_gate——它嵌套 scope_gate、再嵌套本门卫）：
+    现在"全 fail-closed"靠唯一业务路由的依赖链枚举成立，将来谁加路由忘挂 gate
+    就是 fail-open——这是 06 边界检查之外的人肉防线（评审前向风险记录，2026-10-08）。
     """
     credential = current_key()  # 行级：背包里是中间件进门放的凭据串（匿名=None）
     key_id = keystore.verify(credential) if credential else None
@@ -246,14 +261,40 @@ async def auth_gate() -> str:
     return key_id
 
 
-async def rate_limit_gate(_auth: str = Depends(auth_gate)) -> None:
-    """门卫（FastAPI 依赖）：认证之后的一步——按 key 扣令牌，空桶抛 RateLimitError。
+async def scope_gate(request: ChatRequest, _auth: str = Depends(auth_gate)) -> str:
+    """授权门卫（FastAPI 依赖）：按 key 的 scope 判本次请求的 model，越权抛
+    AuthorizationError → 403。门卫链中段：认证 401 → body 422 → 授权 403。
+
+    给初学者的解释（依赖**吃 body** 在本代码库首现）：本函数的 request 形参是
+    ChatRequest（Pydantic 模型），FastAPI 会先校验 body、校验通过才调用我们——
+    body 坏了 FastAPI 只把错误汇成 422、**根本不会进本函数**；body 好了才拿得到
+    request.model 来判 scope。所以"422 先于 403"不是靠谁先写 if，而是"没有合法
+    body 就没有 model 可判"的机械顺序（票面 checklist：授权检查排在 body 校验之后）。
+    为什么 401 又排在 422 前：auth_gate 是本门卫的子依赖，FastAPI 解依赖树先跑它、
+    抛异常立即中止——认证不看 body（spike 实测口径，tests/test_auth_gate.py 钉死）。
+    三者拼起来就是依赖图给出的 401 → 422 → 403，测试在 tests/test_scope_403.py 收口。
+    为什么形参挂着 auth_gate（而不是并列挂在路由上）：嵌套依赖=结构性顺序，不靠
+    参数书写顺序（票 02 同款理由）；且越权请求死在本门卫、进不了限流桶——被拒的
+    请求零成本（不占令牌不进预算），与 401 同待遇。
+    身份从背包取（issue 06 单一出处）：auth_gate 过门时已把背包改写成 key_id，
+    这里不再解析任何请求头；scope 原文交给 check_scope 解释（keys/ 存取与解释分层）。
+    """
+    key_id = current_key()  # 行级：背包里是 auth_gate 改写后的 key_id（到这必有身份）
+    # 行级：scope_of 取原文（存取），查无=None 进 check_scope 即 fail-closed 拒
+    scope_text = keystore.scope_of(key_id) if key_id else None
+    check_scope(scope_text, request.model)  # 行级：不在白名单抛 AuthorizationError → 403
+    return key_id
+
+
+async def rate_limit_gate(_key_id: str = Depends(scope_gate)) -> None:
+    """门卫（FastAPI 依赖）：授权之后的一步——按 key 扣令牌，空桶抛 RateLimitError。
 
     给初学者的解释（FastAPI 依赖在本代码库首现）：Depends(rate_limit_gate) 把本函数
     "钉"在路由前面执行——它跑完返回 None，路由照常；它抛异常，请求到此为止，
     路由本体（乃至上游调用）根本不会发生。门卫与路由分离，路由保持传送带（checklist 6）。
-    为什么形参挂着 auth_gate：认证接在限流之前（ADR-0007 预告）——嵌套依赖是
-    结构性顺序（先认证后限流），_ 前缀=只接线不取值（key 仍从背包取，见下）。
+    为什么形参挂着 scope_gate（W4 票 03 起；票 02 前是 auth_gate）：门卫链的
+    结构性顺序=认证 → 授权 → 限流——嵌套依赖不靠参数书写顺序；_ 前缀=只接线
+    不取值（key 仍从背包取，见下）。新 /v1 路由挂本门卫即天然带上整条链。
     为什么声明 async（虽然体内没有 await）：同步依赖会被 FastAPI 丢进线程池跑，
     async 依赖直跑事件循环——门卫是纯内存一步（扣令牌），不值得占用线程池，
     也免了线程切换；与路由同为 async 是同一条调用约定（同 502 handler 的理由）。
