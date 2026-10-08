@@ -8,8 +8,8 @@ tests/test_ratelimit.py 的主缝上钉；账本/预算装配（issue 06）同�
 
 import pytest
 
-from app.main import create_budget, create_ledger, create_limiter, create_provider
 from app.schemas import Usage
+from assembly import create_budget, create_ledger, create_limiter, create_provider
 from providers.base import Provider
 from providers.dashscope import DashScopeProvider
 from providers.fake import FakeProvider

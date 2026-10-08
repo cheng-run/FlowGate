@@ -1,4 +1,4 @@
-"""FlowGate 应用入口：装配 + FastAPI 路由。
+"""FlowGate 应用入口：从根级 assembly 取装配单例 + FastAPI 路由。
 
 对应"五站走位"（docs/architecture-notes.md §一）：/health 是探活旁路；
 /v1/chat/completions 走"单上游直调"形态（第 3~4 站的 W1 版），并按
@@ -7,156 +7,27 @@ request.stream 分派 JSON 整答或 SSE 流（第 5 站，W2 issue 01 最小闭
 限流门卫（W3 issue 05）是**进路由之前的一步**（FastAPI 依赖形态），路由本体仍零业务。
 """
 
-import os
-
 from fastapi import Depends, FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from app.schemas import ChatCompletionResponse, ChatRequest
+
+# 装配处（根级 assembly）的四个单例转绑到本模块命名空间：既有测试/演示
+# monkeypatch app.main.provider / limiter / ledger / budget 的手法一个不破
+# （票 05 验收项：名字仍绑在 app.main，门卫与路由读到的是同一绑定）。
+# create_provider 一并转出：tests/test_kimi_live.py（live 真网 smoke）以
+# app.main 为装配入口直取生产链，该文件不在本票改动面——别名留着它才不破。
+# 下一行 `as X` 自别名是显式 re-export 形态：本模块不消费这个函数，写成
+# 自别名 ruff F401 才不把它当 unused-import 删掉（不是笔误，是给它的豁免）。
+from assembly import budget, ledger, limiter, provider
+from assembly import create_provider as create_provider
 from billing.identity import current_key, key_var
-from billing.ledger import BillingLedger, BudgetExceededError
-from billing.settlement import BillingProvider
-from providers.base import Provider, UpstreamError
-from providers.dashscope import DEFAULT_BASE_URL, DashScopeProvider
-from providers.fake import FakeProvider
-from providers.kimi import KimiProvider
-from ratelimit.bucket import RateLimiter, RateLimitError
-from routing.chain import AttemptTimeoutError, FallbackChain
+from billing.ledger import BudgetExceededError
+from providers.base import UpstreamError
+from ratelimit.bucket import RateLimitError
+from routing.chain import AttemptTimeoutError
 from routing.request_id import new_request_id, request_id_var
 from streaming.sse import GapTimeoutError, sse_response
-
-
-def create_provider() -> Provider:
-    """装配处核心：按环境变量装上游——逗号表 = 顺序 fallback 链（issue 02，默认 fake）。
-
-    这是生产装配逻辑本身，不是"为测试加的钩子"（spec 决定：不加工厂函数/不上 DI）——
-    选择逻辑无论放哪都得有个名字可调，写成函数只是把装配决策显式化；
-    它不接收任何注入参数，测试与生产走同一条入口。
-    逗号表口径（checklist 2）：FLOWGATE_PROVIDER=a,b = a 先试、a 挂 b 接管；
-    **单值即单元素链**——退化回上游本身，历史行为一字不差（向后兼容：既有装配测试的
-    isinstance(create_provider(), FakeProvider) 断言不改仍绿）。
-    读环境为什么不引 python-dotenv：uv 的 `--env-file .env` 启动时注入环境，
-    代码只读 os.environ——零新增依赖（依赖红线：能零依赖就不引库）。
-    """
-    # 上游选择：FLOWGATE_PROVIDER 缺省 fake——无 key 也能跑测试与演示
-    choice = os.environ.get("FLOWGATE_PROVIDER", "fake")
-    # 复杂语句（推导式）行上：逗号切表、去空白——顺序即 fallback 优先级
-    names = [part.strip() for part in choice.split(",")]
-    # 复杂语句（推导式）行上：逐条装成上游实例（未知/空条目在 _build_one 里响亮报错）
-    providers = [_build_one(name, choice) for name in names]
-    if len(providers) == 1:
-        return providers[0]  # 行级：单元素链退化为上游本身（向后兼容的字面兑现）
-    return FallbackChain(providers)
-
-
-def _build_one(name: str, choice: str) -> Provider:
-    """装一个上游实例——全代码库唯一点名具体适配器类的函数（ADR-0001）。
-
-    为什么拆出来：逗号表要逐条装配，if-ladder 收在这里，"点名适配器"仍只在
-    装配处一处；未知取值/空条目响亮报错（配错喊响），消息带原始 choice 供定位。
-    拆不动说明（函数物理行数超 40，含 docstring/注释；同 routing/chain.py 先例）：
-    if-ladder 就是"唯一点名适配器"的机制本体——拆成每上游一个小函数会把点名面
-    摊到多处，抽 _require_env 通用助手则把各档的配置故事（dashscope 的 base_url
-    有默认 / kimi 双必填，这个不对称是刻意的）藏进第三处；教学注释是规范硬要求
-    删不得，行数超限以本说明豁免。
-    """
-    if name == "fake":
-        return FakeProvider()
-    if name == "dashscope":
-        # 缺 key 必须响亮且指名（故事 10）：静默降级回 fake 会让
-        # "我明明配了真上游，怎么答的还是回显"变成难查的悬案。
-        api_key = os.environ.get("DASHSCOPE_API_KEY", "")
-        if not api_key:
-            raise RuntimeError(
-                "FLOWGATE_PROVIDER=dashscope 但缺少环境变量 DASHSCOPE_API_KEY"
-                "（写入 .env，用 uv run --env-file .env 启动）"
-            )
-        # base_url 可覆盖（默认官方 OpenAI 兼容前缀）：接中转/代理靠这个口子
-        base_url = os.environ.get("DASHSCOPE_BASE_URL", DEFAULT_BASE_URL)
-        return DashScopeProvider(api_key=api_key, base_url=base_url)
-    if name == "kimi":
-        # 缺 key 必须响亮且指名（沿 ADR-0002 纪律，与 dashscope 同款）：静默降级回
-        # fake 会让"我明明配了 kimi，怎么答的还是回显"变成难查的悬案
-        api_key = os.environ.get("KIMI_API_KEY", "")
-        if not api_key:
-            raise RuntimeError(
-                "FLOWGATE_PROVIDER=kimi 但缺少环境变量 KIMI_API_KEY"
-                "（写入 .env，用 uv run --env-file .env 启动）"
-            )
-        # base_url 同样必填、无内置默认（Kimi 与 DashScope 的不对称是刻意的）：Kimi 走
-        # 私有中转，真实地址只活在 .env（issue 08 checklist"真实地址永不进 git"）——
-        # 内置默认地址就是猜，猜错（拿中转 key 打官方地址）是运行期 401 的静默悬案
-        base_url = os.environ.get("KIMI_BASE_URL", "")
-        if not base_url:
-            raise RuntimeError(
-                "FLOWGATE_PROVIDER=kimi 但缺少环境变量 KIMI_BASE_URL"
-                "（真实中转地址写入 .env，不入 git；用 uv run --env-file .env 启动）"
-            )
-        return KimiProvider(api_key=api_key, base_url=base_url)
-    # 未知取值（含空条目）同样响亮报错：拼错的上游名若静默回 fake，配置就形同虚设
-    raise RuntimeError(
-        f"未知的上游 {name!r}（FLOWGATE_PROVIDER={choice!r}；可选：fake / dashscope / kimi）"
-    )
-
-
-def create_limiter() -> RateLimiter:
-    """装配处：按环境变量装限流器（env 口径，与 create_provider 同一纪律）。
-
-    FLOWGATE_RATE_CAPACITY=桶容量（允许的突发），FLOWGATE_RATE_PER_SECOND=稳态吞吐
-    （tokens/s）。默认 20/10：LLM 客户端天然突发（一条请求一轮对话），20 的突发余量
-    给交互式客户端留了面子，10/s 的稳态又足以拦住打爆型流量——口径随部署调 env 即可，
-    不用改代码。配置非法（非数字/越界）响亮报错（配错喊响，同 _build_one 纪律）。
-    为什么不加工厂函数/不上 DI：与 create_provider 同一理由——这是生产装配逻辑本身，
-    测试与生产走同一条入口，测试要换限流口径时 monkeypatch 装配绑定（app.main.limiter）。
-    """
-    try:
-        capacity = float(os.environ.get("FLOWGATE_RATE_CAPACITY", "20"))
-        per_second = float(os.environ.get("FLOWGATE_RATE_PER_SECOND", "10"))
-        return RateLimiter(capacity=capacity, per_second=per_second)
-    except ValueError as exc:
-        # 行级：数字解析失败与桶参数越界都是配置错——统一指名 env 变量，排错不用猜
-        raise RuntimeError(
-            f"FLOWGATE_RATE_CAPACITY / FLOWGATE_RATE_PER_SECOND 配置非法：{exc}"
-        ) from exc
-
-
-def create_ledger() -> BillingLedger:
-    """装配处：按环境变量装账本（env 口径，与 create_provider 同一纪律）。
-
-    FLOWGATE_BILLING_DB=SQLite 单文件路径（生产在 .env 指向落盘文件）；缺省
-    ":memory:"=进程内临时库——测试/演示零残留、离线可复跑（checklist 1 的口径：
-    测试用 tmp_path 临时文件显式构造账本，不依赖缺省）。
-    """
-    db_path = os.environ.get("FLOWGATE_BILLING_DB", ":memory:")
-    return BillingLedger(db_path)
-
-
-def create_budget() -> int:
-    """装配处：按环境变量装每 key 的 token 预算（FLOWGATE_BUDGET_TOKENS）。
-
-    0=不设限（缺省）：记账先跑、预算口径按部署调 env——"0"是"无预算"不是"零预算"。
-    为什么不给个有限缺省：预算一旦有限，账本跨重启累计（生产）就会在跑批场景里
-    突然 429；治理口径宁可显式开启（与限流不同：限流天然要挡，预算天然要看部署）。
-    """
-    try:
-        return int(os.environ.get("FLOWGATE_BUDGET_TOKENS", "0"))
-    except ValueError as exc:
-        # 行级：非数字=配置错，统一指名 env 变量（配错喊响，同 create_limiter 纪律）
-        raise RuntimeError(f"FLOWGATE_BUDGET_TOKENS 配置非法：{exc}") from exc
-
-
-# ===== 装配处（composition root）=====
-# 全代码库唯一允许点名具体适配器类的地方（ADR-0001）：核心路由只见 Provider 协议，
-# 换上游=改环境变量 FLOWGATE_PROVIDER，业务代码一行不动。
-# 账本单例先落座：结算门面与门卫的预算检查共用同一本账（用户账求和=花销唯一出处）
-ledger: BillingLedger = create_ledger()
-# 每 key 的 token 预算（0=不设限）：门卫进门先查它，超预算在上游调用前就 429
-budget: int = create_budget()
-# 结算门面包在**装配绑定**上、不进 create_provider：create_provider 的既有契约是
-# 装出可 isinstance 的上游/链（装配测试钉住），计费是其外的一层治理（与门卫同理）。
-provider: Provider = BillingProvider(create_provider(), ledger=ledger)
-# 限流器与上游同在装配处落座：门卫只认 RateLimiter 接口，换限流算法不惊动路由
-limiter: RateLimiter = create_limiter()
 
 app = FastAPI(
     title="FlowGate",
