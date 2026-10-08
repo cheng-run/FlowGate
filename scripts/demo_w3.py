@@ -33,7 +33,7 @@ import sys
 import httpx
 import uvicorn
 
-# 行级：装配处（app.main 的 create_provider）在 import 时读环境——先钉死 fake 再 import，
+# 行级：装配处（根级 assembly 的 create_provider）在 import 时读环境——先钉死 fake 再 import，
 # 保证零外网、零 key 不受宿主环境影响（用户就算配了 DASHSCOPE_API_KEY，三幕也绝不触网）
 os.environ["FLOWGATE_PROVIDER"] = "fake"
 
@@ -42,7 +42,7 @@ os.environ["FLOWGATE_PROVIDER"] = "fake"
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
-# 以下项目内 import 必须垫在环境钉子之后（app.main 的装配处在 import 时读环境）
+# 以下项目内 import 必须垫在环境钉子之后（根级 assembly 的装配处在 import 时读环境）
 import app.main as gateway  # noqa: E402
 import ratelimit.bucket as bucket_module  # noqa: E402
 from app.schemas import ChatMessage, ChatRequest, Usage  # noqa: E402
