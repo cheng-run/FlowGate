@@ -18,3 +18,12 @@ docs/
 
 # 运行期 SQLite 库（serve 缺省 flowgate.db）——数据文件永不入库（w4 票 07）
 *.db
+
+# 教学工作区（/teach skill 产出：使命/课程/速查/学习记录）——教练材料与 docs/ 同待遇，公开面=代码+测试+README（2026-10-09 用户定）
+MISSION.md
+RESOURCES.md
+NOTES.md
+lessons/
+reference/
+learning-records/
+assets/
